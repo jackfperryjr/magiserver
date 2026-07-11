@@ -24,6 +24,8 @@ COPY . .
 RUN npm run build
 
 ENV MAGILOOM_DATA_DIR=/data
-VOLUME ["/data"]
+# Persist /data by attaching a Railway Volume with mount path /data in the
+# service's settings. Railway ignores the Dockerfile VOLUME instruction, so it's
+# intentionally omitted; without an attached volume /data is ephemeral.
 EXPOSE 8787
 CMD ["npm", "start"]
