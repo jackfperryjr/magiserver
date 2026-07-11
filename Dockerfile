@@ -5,7 +5,7 @@ FROM node:20-bookworm-slim
 # Ruby for Lich. Lich 5 needs Ruby + a few gems (sqlite3, gtk is NOT needed in
 # --without-frontend / frostbite headless mode).
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      ruby ruby-dev build-essential libsqlite3-dev git ca-certificates \
+      ruby ruby-dev build-essential libsqlite3-dev pkg-config git ca-certificates \
     && gem install sqlite3 --no-document \
     && rm -rf /var/lib/apt/lists/*
 
