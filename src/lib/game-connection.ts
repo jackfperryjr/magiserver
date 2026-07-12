@@ -4,6 +4,7 @@ import { EventEmitter } from 'events'
 export class GameConnection extends EventEmitter {
   private socket: Socket | null = null
   private buffer = ''
+  private idleTimer: ReturnType<typeof setTimeout> | null = null
 
   connectDirect(host: string, port: number, key: string): void {
     if (this.socket) this.disconnect()
@@ -93,6 +94,7 @@ export class GameConnection extends EventEmitter {
     this.socket?.destroy()
     this.socket = null
     this.buffer = ''
+    if (this.idleTimer) { clearTimeout(this.idleTimer); this.idleTimer = null }
   }
 
   send(data: string): void {
@@ -154,5 +156,25 @@ export class GameConnection extends EventEmitter {
 
     // Put back any incomplete accumulation
     this.buffer = accum ? accum + buf.slice(pos) : buf.slice(pos)
+    this.armIdleFlush()
+  }
+
+  // The tag-depth chunker above waits for balanced tags before emitting. DR's
+  // StormFront stream can leave it mid-accumulation (unbalanced pushStream, prompt
+  // quirks), stranding the initial room/vitals until the next command completes the
+  // tags. If the stream goes quiet with data still buffered, emit it so the game
+  // state shows without a nudge. A continuous burst keeps rescheduling this, so it
+  // only fires once the stream truly settles.
+  private armIdleFlush(): void {
+    if (this.idleTimer) { clearTimeout(this.idleTimer); this.idleTimer = null }
+    if (!this.buffer) return
+    this.idleTimer = setTimeout(() => {
+      this.idleTimer = null
+      const pending = this.buffer
+      if (pending.trim()) {
+        this.buffer = ''
+        this.emit('data', pending.endsWith('\n') ? pending : pending + '\n')
+      }
+    }, 300)
   }
 }
