@@ -6,7 +6,8 @@ FROM ruby:3.4-slim-bookworm
 
 # Node.js 20 + the C toolchain Lich's native gems (sqlite3, ffi) need to build.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      curl ca-certificates git build-essential libsqlite3-dev libffi-dev pkg-config \
+      curl ca-certificates git build-essential libsqlite3-dev libffi-dev \
+      libssl-dev zlib1g-dev pkg-config \
     && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
     && apt-get install -y --no-install-recommends nodejs \
     && rm -rf /var/lib/apt/lists/*
