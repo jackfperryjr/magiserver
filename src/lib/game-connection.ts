@@ -46,7 +46,7 @@ export class GameConnection extends EventEmitter {
       this.emit('connected')
     })
     s.on('data',  (c: string) => { this.buffer += c; this.flush() })
-    s.on('close', ()          => { this.emit('disconnected'); this.socket = null })
+    s.on('close', ()          => { if (this.socket === s) { this.emit('disconnected'); this.socket = null } })
     s.on('error', (err) => {
       s.destroy()
       if (err.message.includes('ECONNREFUSED') && attempts < 240) {
@@ -74,7 +74,7 @@ export class GameConnection extends EventEmitter {
       this.emit('connected')
     })
     s.on('data',  (c: string) => { this.buffer += c; this.flush() })
-    s.on('close', ()          => { this.emit('disconnected'); this.socket = null })
+    s.on('close', ()          => { if (this.socket === s) { this.emit('disconnected'); this.socket = null } })
     s.on('error', (err) => {
       s.destroy()
       if (err.message.includes('ECONNREFUSED') && attempts < 240) {
