@@ -19,9 +19,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 COPY package*.json ./
-RUN npm ci --omit=dev || npm install --omit=dev
+# Install all deps (incl. dev) so tsc is available for the build.
+RUN npm ci || npm install
 COPY . .
-RUN npm run build
+# Compile TypeScript, then drop dev deps to slim the runtime image.
+RUN npm run build && npm prune --omit=dev
 
 ENV MAGILOOM_DATA_DIR=/data
 # Persist /data by attaching a Railway Volume with mount path /data in the
