@@ -83,16 +83,3 @@ server → client   { "t":"event",  "channel":"game:data", "args":["<stream ...>
 The renderer's WebSocket `dr.*` transport (the next step) maps each
 `dr.game.send(x)` to an `invoke` and each `dr.game.onData(cb)` to the `game:data`
 event — so the existing React app runs unchanged against this server.
-
-## Push notifications (PWA)
-
-Server-side rule evaluation is **wired** (`src/trigger-engine.ts` → `push.notify`),
-so alerts fire even when the PWA is closed. Push subscriptions are per-user.
-
-Client side (the remaining work, in the renderer):
-1. `GET /push/vapid` → `applicationServerKey`.
-2. Register a service worker, `pushManager.subscribe(...)`.
-3. `POST /push/subscribe` with `{ userId, subscription }`.
-4. In the service worker, show the notification on `push`.
-
-iOS requires the PWA be added to the Home Screen for Web Push to work.
