@@ -108,6 +108,59 @@ export class LichManager extends EventEmitter {
   }
 
   /**
+   * Launch Lich fully headless: it self-authenticates from its saved entry.yaml
+   * (see lich-home.ts writeLichEntry) via `--login <Char>`, connects to the game
+   * itself, and exposes a detachable client on `listenPort` (`--headless=PORT`
+   * expands to `--without-frontend --detachable-client=PORT`). No primary frontend
+   * and no fixed 127.0.0.1:11024 listener, so any number of sessions coexist — each
+   * on its own port. The caller's GameConnection attaches to `listenPort` with a
+   * plain connect (no key/handshake); Lich streams StormFront XML to it.
+   */
+  spawnHeadless(
+    characterName: string,
+    listenPort: number,
+    lichPathOverride?: string,
+    dirs?: { home?: string; lib?: string; scripts?: string }
+  ): { ok: boolean; error?: string } {
+    if (this.process) this.stop()
+
+    const lichPath = this.getLichPath(lichPathOverride)
+    if (!lichPath) {
+      this.setStatus('error')
+      return { ok: false, error: 'Lich not found. Set the path in Settings.' }
+    }
+    const rubyPath = this.getRubyPath()
+
+    // Credentials are NOT on the command line — they live in entry.yaml — so the
+    // launch line is safe to log verbatim.
+    const args = [
+      lichPath,
+      '--dragonrealms',
+      '--login', characterName,
+      `--headless=${listenPort}`,
+    ]
+    if (dirs?.home)    args.push(`--home=${dirs.home}`)
+    if (dirs?.lib)     args.push(`--lib=${dirs.lib}`)
+    if (dirs?.scripts) args.push(`--scripts=${dirs.scripts}`)
+
+    this.emit('log', `Launching Lich (headless, port ${listenPort}): ${rubyPath} ${args.join(' ')}`)
+    this.setStatus('starting')
+    this._spawn(rubyPath, args)
+
+    // Lich self-login (SGE + game connect) then opens the detachable port; the
+    // GameConnection retry loop attaches once it's up. Signal ready after 8s like
+    // spawnOnly so scripts don't start before the initial XML is parsed.
+    setTimeout(() => {
+      if (this.status === 'starting') {
+        this.setStatus('ready')
+        this.emit('ready', listenPort)
+      }
+    }, 8000)
+
+    return { ok: true }
+  }
+
+  /**
    * Launch Lich in detachable-client mode for script execution only.
    * Uses port polling since this mode doesn't broker the game connection.
    */

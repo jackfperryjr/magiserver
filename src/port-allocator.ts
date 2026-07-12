@@ -16,6 +16,21 @@ export class PortAllocator {
   // custom-port path, which is still experimental — see lich-manager.ts).
   constructor(private readonly start = 11024, private readonly end = 11999) {}
 
+  /**
+   * The one frontend port headless Lich actually works on. Lich's `-g` primary
+   * listener is hardwired to bind 127.0.0.1:11024 (the DR game port) with no flag
+   * to move it, so only ONE Lich can run per container until we build detachable-
+   * client broker mode. See lich-manager.ts and session.ts.
+   */
+  get primaryPort(): number { return this.start }
+
+  /** Claim the proven primary port if free; null when another session holds it. */
+  acquirePrimary(): number | null {
+    if (this.used.has(this.start)) return null
+    this.used.add(this.start)
+    return this.start
+  }
+
   /** Reserve the lowest free port in the pool. Throws when exhausted. */
   acquire(): number {
     for (let p = this.start; p <= this.end; p++) {

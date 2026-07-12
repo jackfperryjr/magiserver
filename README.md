@@ -18,7 +18,7 @@ where **Lich runs remotely**.
 | Windows / dialogs / updater | dropped | client-side concerns on the web build |
 | desktop toast/desktop notifications | `src/push.ts` + `src/trigger-engine.ts` | server evaluates alert rules → Web Push |
 | (new) per-user data isolation | `src/user-context.ts` | one dir per user; scales to many users |
-| (new) multi-Lich support | `src/port-allocator.ts` | unique Lich frontend port per session |
+| (new) multi-Lich (headless) | `src/lich-manager.ts` `spawnHeadless` + `src/port-allocator.ts` | each session runs Lich `--login --headless=PORT` on its own detachable port |
 
 Each connected client gets its own `Session` (its own game socket + Lich + script
 engine + trigger engine), exactly like one Electron window.
@@ -30,7 +30,13 @@ engine + trigger engine), exactly like one Electron window.
   share one in-memory store (no write race). Plain JSON, one small file per user —
   fine for hundreds of users; **no Postgres needed**.
 - **Server-global**: the world **map** is one shared DB (community map, like the
-  desktop's shared map DB), and Lich frontend **ports** come from a shared pool.
+  desktop's shared map DB), and Lich frontend **ports** come from a shared pool
+  (`port-allocator.ts`). Each Lich runs **headless** (`--login <Char>
+  --headless=<port>`): Lich self-authenticates from a per-user `entry.yaml`, owns
+  the game connection, and exposes a private detachable port the session attaches
+  to — so many characters run Lich concurrently, each on its own port (no more
+  fighting over Lich's fixed 127.0.0.1:11024 frostbite listener). Set
+  `MAGILOOM_LICH_FROSTBITE=1` to fall back to the old one-per-container path.
 - **User identity**: today the WS `?user=<account>` param picks the bucket (a
   client-supplied hint). In production, derive it from an authenticated per-user
   token instead of trusting the client.
@@ -63,7 +69,10 @@ user gets an isolated home at `data/users/<id>/lich/` (`lich-home.ts`). The
 immutable Lich engine (`lib/`) and the ~234-script community library
 (`scripts/*.lic`) come from the shared read-only base (`MAGILOOM_LICH_SHARED`,
 baked at `/opt/lich`) and are **symlinked** into each home — no per-user copies.
-Launch flags: `--home=<user home> --lib=<shared>/lib --scripts=<user home>/scripts`.
+Launch flags: `--login <Char> --headless=<port> --home=<user home> --lib=<shared>/lib
+--scripts=<user home>/scripts`. The `--home` also holds `data/entry.yaml` — the
+per-user saved login (0600, plaintext, jailed to that home) Lich reads to
+self-authenticate headlessly.
 
 Users manage their setup through the PWA (upload + in-app edit) via four channels,
 **path-jailed** to their `profiles/` and `custom/` dirs only (the shared library

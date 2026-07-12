@@ -13,7 +13,7 @@ import { encryptString, decryptString, isEncryptionAvailable } from './crypto'
 import type { UserContext } from './user-context'
 import type { PortAllocator } from './port-allocator'
 import { TriggerEngine, DEFAULT_PUSH, type NotifRule, type PushConfig } from './trigger-engine'
-import { provisionLichHome, ensureUserScriptsDir, sharedLichRoot } from './lich-home'
+import { provisionLichHome, ensureUserScriptsDir, sharedLichRoot, writeLichEntry } from './lich-home'
 import { listFiles, readFile, writeFile, deleteFile } from './lich-files'
 
 /** Sends an event to the connected client (replaces mainWindow.webContents.send). */
@@ -50,6 +50,9 @@ export class Session {
   private pendingSelectInstance:  ((code: string) => Promise<unknown>) | null = null
   private pendingSelectCharacter: ((id: string) => Promise<SGELaunchKey>) | null = null
   private lichReadyDetected = false
+  // Held only between login() and selectCharacter() so headless Lich can write its
+  // saved-login entry.yaml; cleared right after (never persisted in the session).
+  private loginPassword: string | null = null
 
   constructor(
     private readonly user: UserContext,
@@ -245,6 +248,7 @@ export class Session {
     const result = await sgeAuth(account, password, (l) => this.lichLog('[sge] ' + l))
     if (!result.ok) return result
     this.pendingSelectInstance = result.selectInstance
+    this.loginPassword = password   // consumed by headless Lich in selectCharacter
     this.user.settings.saveAccount(account)
     return { ok: true, instances: result.instances }
   }
@@ -283,16 +287,46 @@ export class Session {
     const home = wantsLich ? provisionLichHome(this.server.dataDir, this.user.userId) : null
 
     if (home) {
-      // Allocate a unique frontend port so multiple users' Lich instances don't
-      // collide on 11024, and launch against this user's isolated home.
       this.stopLich()
-      this.lichPort = this.server.ports.acquire()
-      this.lichLog(`[sge] Launching Lich (frostbite mode, port ${this.lichPort}) for ${characterName}...`)
-      this.lichMgr.spawnOnly(key.host, key.port, home.lichRbw, this.lichPort, {
-        home: home.home, lib: home.lib, scripts: home.scripts,
-      })
-      this.lichLog(`[sge] Connecting to Lich on port ${this.lichPort}...`)
-      this.gameConn.connectWithKey('127.0.0.1', this.lichPort, key.key)
+      if (process.env['MAGILOOM_LICH_FROSTBITE'] === '1') {
+        // Legacy single-instance path: Lich's frostbite `-g` listener is hardwired
+        // to 127.0.0.1:11024, so only ONE can run per container. Gate to that slot
+        // and connect any extra session directly. Kept as a fallback in case the
+        // headless path misbehaves against a given Lich build.
+        const port = this.server.ports.acquirePrimary()
+        if (port === null) {
+          this.lichLog('[sge] Another Lich session is already active on this server — connecting this character directly.')
+          this.emit('lich:status', 'stopped')
+          this.gameConn.connectDirect(key.host, key.port, key.key)
+          return { ok: true, lich: false, lichBusy: true }
+        }
+        this.lichPort = port
+        this.lichLog(`[sge] Launching Lich (frostbite mode, port ${this.lichPort}) for ${characterName}...`)
+        this.lichMgr.spawnOnly(key.host, key.port, home.lichRbw, this.lichPort, {
+          home: home.home, lib: home.lib, scripts: home.scripts,
+        })
+        this.lichLog(`[sge] Connecting to Lich on port ${this.lichPort}...`)
+        this.gameConn.connectWithKey('127.0.0.1', this.lichPort, key.key)
+      } else if (!this.loginPassword) {
+        // Headless Lich self-logs-in from entry.yaml, which needs the password we
+        // only hold during the login flow. Missing (e.g. a resumed session) → direct.
+        this.lichLog('[sge] No password available for headless Lich; connecting directly.')
+        this.emit('lich:status', 'stopped')
+        this.gameConn.connectDirect(key.host, key.port, key.key)
+        return { ok: true, lich: false }
+      } else {
+        // Headless/broker mode (default): Lich authenticates itself and exposes a
+        // unique detachable port, so any number of characters run Lich at once.
+        writeLichEntry(home.home, accountName, this.loginPassword, characterName)
+        this.loginPassword = null
+        this.lichPort = this.server.ports.acquire()
+        this.lichLog(`[sge] Launching Lich (headless mode, port ${this.lichPort}) for ${characterName}...`)
+        this.lichMgr.spawnHeadless(characterName, this.lichPort, home.lichRbw, {
+          home: home.home, lib: home.lib, scripts: home.scripts,
+        })
+        this.lichLog(`[sge] Attaching to Lich detachable client on port ${this.lichPort}...`)
+        this.gameConn.connect('127.0.0.1', this.lichPort)
+      }
     } else {
       if (wantsLich) {
         this.lichLog('[sge] Lich requested but no shared install found — connecting directly.')
@@ -317,6 +351,7 @@ export class Session {
 
   /** Tear down per-session resources (mirrors window-all-closed for one window). */
   dispose(): void {
+    this.loginPassword = null
     this.cmdEngine.stop()
     this.gameConn.disconnect()
     this.stopLich()

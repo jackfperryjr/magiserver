@@ -1,6 +1,6 @@
 import { join } from 'path'
 import {
-  existsSync, mkdirSync, readdirSync, symlinkSync, copyFileSync, statSync,
+  existsSync, mkdirSync, readdirSync, symlinkSync, copyFileSync, statSync, writeFileSync,
 } from 'fs'
 
 // ── Per-user Lich home provisioning ─────────────────────────────────────────────
@@ -97,4 +97,44 @@ export function provisionLichHome(baseDataDir: string, userId: string): LichHome
   }
 
   return { home, lib: join(shared, 'lib'), scripts, lichRbw: join(shared, 'lich.rbw') }
+}
+
+// Double-quoted YAML scalar with the two escapes YAML actually requires.
+function yamlQuote(s: string): string {
+  return `"${s.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`
+}
+
+/**
+ * Write Lich's saved-login file at <home>/data/entry.yaml (DATA_DIR under --home),
+ * so `lich --login <Char> --headless=<port>` can authenticate with no frontend and
+ * no game key forwarded from us — which is what lets many Lich sessions run at once
+ * (each gets its own detachable port instead of all fighting for 127.0.0.1:11024).
+ *
+ * Plaintext, matching Lich's own default store; the file lives inside this user's
+ * isolated, path-jailed home and is 0600. game_code is DR (this server is DR-only).
+ */
+export function writeLichEntry(
+  home: string, account: string, password: string, charName: string,
+): void {
+  const acct = account.trim().toUpperCase()
+  const char = charName.trim().replace(/^(.)(.*)$/, (_m, a: string, b: string) => a.toUpperCase() + b.toLowerCase())
+  const yaml =
+`# Lich 5 Login Entries - YAML Format
+encryption_mode: plaintext
+master_password_validation_test:
+accounts:
+  ${yamlQuote(acct)}:
+    password: ${yamlQuote(password)}
+    characters:
+    - char_name: ${yamlQuote(char)}
+      game_code: "DR"
+      game_name: "DragonRealms"
+      frontend: "stormfront"
+      custom_launch:
+      custom_launch_dir:
+      is_favorite: false
+`
+  const dataDir = join(home, 'data')
+  mkdirSync(dataDir, { recursive: true })
+  writeFileSync(join(dataDir, 'entry.yaml'), yaml, { mode: 0o600 })
 }
