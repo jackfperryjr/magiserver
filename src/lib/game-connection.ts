@@ -10,8 +10,15 @@ export class GameConnection extends EventEmitter {
     this.socket = new Socket()
     this.socket.setEncoding('latin1')
     this.socket.on('connect', () => {
+      // Full StormFront game-server login. Talking straight to the game (no Lich),
+      // the server needs the complete FE identification + two blank lines, exactly
+      // as Wrayth/Lich send — the bare "/FE:STORMFRONT" is only enough for Lich,
+      // which re-does this handshake itself. Sending the short form to the game
+      // server makes it accept the socket then drop it.
       this.socket!.write(key + '\n', 'latin1')
-      this.socket!.write('/FE:STORMFRONT\n', 'latin1')
+      this.socket!.write('/FE:STORMFRONT /VERSION:1.0.1.26 /P:WIN_XP /XML\n', 'latin1')
+      this.socket!.write('\n', 'latin1')
+      this.socket!.write('\n', 'latin1')
       this.emit('connected')
     })
     this.socket.on('data',  (c: string) => { this.buffer += c; this.flush() })

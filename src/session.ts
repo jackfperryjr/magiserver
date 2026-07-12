@@ -101,7 +101,7 @@ export class Session {
 
     this.gameConn.on('log',          (l: string) => this.lichLog('[game] ' + l))
     this.gameConn.on('connected',    () => { this.lichLog('[game] Connected'); this.emit('game:connected') })
-    this.gameConn.on('disconnected', () => this.emit('game:disconnected'))
+    this.gameConn.on('disconnected', () => { this.lichLog('[game] Disconnected'); this.emit('game:disconnected') })
     this.gameConn.on('error',        (e: string) => { this.lichLog('[game] Error: ' + e); this.emit('game:error', e) })
     this.gameConn.on('data',         (r: string) => {
       this.emit('game:data', r)
