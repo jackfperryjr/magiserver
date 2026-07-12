@@ -11,7 +11,10 @@
 export class PortAllocator {
   private readonly used = new Set<number>()
 
-  constructor(private readonly start = 11100, private readonly end = 11999) {}
+  // Start at 11024 (Lich's built-in frontend port) so the FIRST session uses the
+  // proven no-`--detachable-client` frostbite path; later sessions get 11025+ (the
+  // custom-port path, which is still experimental — see lich-manager.ts).
+  constructor(private readonly start = 11024, private readonly end = 11999) {}
 
   /** Reserve the lowest free port in the pool. Throws when exhausted. */
   acquire(): number {

@@ -1,21 +1,36 @@
-# Magiloom server image: Node (gateway) + Ruby (Lich). Railway can build this
-# directly. Lich is optional — omit the Ruby layers if you only ever direct-connect.
-FROM node:20-bookworm-slim
+# Magiloom server image: Ruby (Lich) + Node (gateway).
+#
+# The Ruby base carries Lich; Node.js is layered on for the gateway. Lich itself
+# is CLONED from GitHub at build time (below) — nothing to upload by hand.
+FROM ruby:3.4-slim-bookworm
 
-# Ruby for Lich. Lich 5 needs Ruby + a few gems (sqlite3, gtk is NOT needed in
-# --without-frontend / frostbite headless mode).
+# Node.js 20 + the C toolchain Lich's native gems (sqlite3, ffi) need to build.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      ruby ruby-dev build-essential libsqlite3-dev pkg-config git ca-certificates \
-    && gem install sqlite3 --no-document \
+      curl ca-certificates git build-essential libsqlite3-dev libffi-dev pkg-config \
+    && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
+    && apt-get install -y --no-install-recommends nodejs \
     && rm -rf /var/lib/apt/lists/*
 
-# --- Lich install (optional) ---------------------------------------------------
-# Bake the shared, read-only Lich install here; each user gets an isolated home
-# seeded from it (src/lich-home.ts symlinks the community script library in).
-# MAGILOOM_LICH_SHARED points the server at it. Omit this + the env var to run
-# direct-connect only (no Lich).
-# RUN git clone --depth 1 https://github.com/elanthia-online/lich-5.git /opt/lich
-# ENV MAGILOOM_LICH_SHARED=/opt/lich
+# --- Shared Lich engine --------------------------------------------------------
+# Read-only base cloned into /opt/lich; each user gets an isolated home seeded
+# from it (src/lich-home.ts). MAGILOOM_LICH_SHARED points the server at it, which
+# lights up the "Connect with Lich" toggle. Lich runs headless in frostbite mode,
+# so skip the GUI (gtk), dev and profanity gem groups. `bundle install` puts the
+# gems on the system load path where lich.rbw's plain `require`s find them.
+#
+# NOTE: baking Lich here is still experimental — Lich has not been verified running
+# headless on Linux in this setup. A failed build does NOT take down your running
+# deploy (Railway keeps the last good one until a new build succeeds).
+RUN git clone --depth 1 https://github.com/elanthia-online/lich-5.git /opt/lich \
+    && cd /opt/lich \
+    && bundle lock --add-platform x86_64-linux \
+    && bundle config set --local without 'development vscode gtk profanity' \
+    && bundle install
+ENV MAGILOOM_LICH_SHARED=/opt/lich
+
+# Want the ~237-script DR community library baked in too? Uncomment:
+# RUN git clone --depth 1 https://github.com/elanthia-online/dr-scripts.git /tmp/dr \
+#     && cp /tmp/dr/*.lic /opt/lich/scripts/ 2>/dev/null || true
 
 WORKDIR /app
 COPY package*.json ./
