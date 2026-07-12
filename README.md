@@ -41,6 +41,15 @@ engine + trigger engine), exactly like one Electron window.
 against the game stream and calls `push.notify(payload, userId)` — so alerts fire
 even when the PWA is closed (a closed page runs no JS, so the client can't).
 Push subscriptions are keyed by `userId`, so only that user's devices are pinged.
+
+It also pushes **conversation & mentions** (opt-in, `settings.push`): the raw
+chunk still carries DR's `<preset id='speech|whisper|thought'>` tags, so the engine
+classifies each line the same way the renderer does (quote heuristic filters exp
+readouts, which reuse the `whisper` preset) and pushes whispers / room says /
+thoughts / your-name mentions per the user's `push.{whisper,speech,thought,mention}`
+toggles. Off by default. The service worker suppresses a push when a window is
+focused so it never doubles the in-app toast; a small recent-text cache swallows
+DR's duplicate chunks.
 **Command** triggers (rules that send a game command) are OFF server-side by
 default to avoid double-firing while the renderer still evaluates them; flip
 `autoRunCommandTriggers` in `session.ts` once the thin client stops doing so.

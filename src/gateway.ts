@@ -1,4 +1,5 @@
 import type { Server as HttpServer } from 'http'
+import { randomUUID } from 'crypto'
 import { WebSocketServer, WebSocket } from 'ws'
 import { Session, type ServerContext } from './session'
 import type { UserRegistry } from './user-context'
@@ -24,6 +25,9 @@ const GRACE_MS = Number(process.env['MAGILOOM_SESSION_GRACE_MS'] ?? 5 * 60 * 100
 
 interface LiveSession { session: Session; grace: ReturnType<typeof setTimeout> | null }
 
+/** Extra fields we stash on the upgrade request to carry into the connection. */
+interface ConnReq { magiloomUser?: string; magiloomKey?: string }
+
 /** Attach the game WebSocket gateway at /ws on an existing HTTP server. */
 export function attachGateway(
   httpServer: HttpServer,
@@ -32,7 +36,10 @@ export function attachGateway(
 ): void {
   const wss = new WebSocketServer({ noServer: true })
 
-  // One live session per user, retained briefly across reconnects (see GRACE_MS).
+  // One live session per CLIENT connection (userId|conn), retained briefly across
+  // reconnects (see GRACE_MS). Keyed by connection — not by data bucket — so two
+  // clients sharing a `?user=` bucket (a second device, or two tabs) each get their
+  // own game session instead of the newcomer hijacking the first's DR stream.
   const sessions = new Map<string, LiveSession>()
 
   httpServer.on('upgrade', (req, socket, head) => {
@@ -55,29 +62,36 @@ export function attachGateway(
     // authenticated per-user token, not trusted from the client. Falls back to a
     // shared "default" bucket (single-user behaviour) when absent.
     const userId = url.searchParams.get('user') ?? 'default'
-    ;(req as { magiloomUser?: string }).magiloomUser = userId
+    // Per-client connection id (see web config.ts). Absent → a fresh unique id, so
+    // an old client that doesn't send one is simply never resumable, never hijacked.
+    const conn = url.searchParams.get('conn') || randomUUID()
+    const r = req as ConnReq
+    r.magiloomUser = userId
+    r.magiloomKey  = `${userId}|${conn}`
 
     wss.handleUpgrade(req, socket, head, (ws) => wss.emit('connection', ws, req))
   })
 
-  wss.on('connection', (ws: WebSocket, req: { magiloomUser?: string }) => {
+  wss.on('connection', (ws: WebSocket, req: ConnReq) => {
     const userId = req.magiloomUser ?? 'default'
+    const key    = req.magiloomKey ?? userId
     const emit = (channel: string, ...args: unknown[]) => {
       if (ws.readyState === WebSocket.OPEN) {
         ws.send(JSON.stringify({ t: 'event', channel, args }))
       }
     }
 
-    // Re-attach to a session kept alive during its grace window (resumes the same
-    // DR connection), else start a fresh one for this user.
-    let live = sessions.get(userId)
+    // Re-attach to THIS client's session kept alive during its grace window (resumes
+    // the same DR connection), else start a fresh one. The key is per-connection, so
+    // a different client on the same data bucket never re-attaches here.
+    let live = sessions.get(key)
     if (live) {
       if (live.grace) { clearTimeout(live.grace); live.grace = null }
       live.session.setEmit(emit)
     } else {
       const userCtx = registry.get(userId)
       live = { session: new Session(userCtx, server, emit), grace: null }
-      sessions.set(userId, live)
+      sessions.set(key, live)
     }
     const session = live.session
     session.replayInitialState()
@@ -103,10 +117,10 @@ export function attachGateway(
     // connection) for the grace window so a reconnect resumes. Only dispose if no
     // reconnect arrives, and only if this exact session is still the current one.
     const onGone = () => {
-      const cur = sessions.get(userId)
+      const cur = sessions.get(key)
       if (!cur || cur.session !== session || cur.grace) return
       cur.grace = setTimeout(() => {
-        if (sessions.get(userId) === cur) sessions.delete(userId)
+        if (sessions.get(key) === cur) sessions.delete(key)
         session.dispose()
       }, GRACE_MS)
     }

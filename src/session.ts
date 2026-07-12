@@ -12,7 +12,7 @@ import { ensurePortrait } from './lib/portrait-service'
 import { encryptString, decryptString, isEncryptionAvailable } from './crypto'
 import type { UserContext } from './user-context'
 import type { PortAllocator } from './port-allocator'
-import { TriggerEngine, type NotifRule } from './trigger-engine'
+import { TriggerEngine, DEFAULT_PUSH, type NotifRule, type PushConfig } from './trigger-engine'
 import { provisionLichHome, ensureUserScriptsDir, sharedLichRoot } from './lich-home'
 import { listFiles, readFile, writeFile, deleteFile } from './lich-files'
 
@@ -64,10 +64,15 @@ export class Session {
     // Command-trigger auto-run stays OFF so the renderer stays authoritative and
     // commands don't double-fire; see trigger-engine.ts.
     this.triggers = new TriggerEngine(
-      () => ({
-        notifRules: (s.getAll() as unknown as { notifRules?: NotifRule[] }).notifRules ?? [],
-        triggers:   s.getCharSettings(this.charName).triggers,
-      }),
+      () => {
+        const all = s.getAll() as unknown as { notifRules?: NotifRule[]; push?: PushConfig }
+        return {
+          notifRules: all.notifRules ?? [],
+          triggers:   s.getCharSettings(this.charName).triggers,
+          push:       all.push ?? DEFAULT_PUSH,
+          charName:   this.charName,
+        }
+      },
       (cmd) => { this.gameConn.send(cmd); this.emit('game:sent', cmd) },
       { userId: this.user.userId, autoRunCommandTriggers: false },
     )
