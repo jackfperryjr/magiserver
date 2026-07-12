@@ -54,7 +54,7 @@ export class Session {
   constructor(
     private readonly user: UserContext,
     private readonly server: ServerContext,
-    private readonly emit: Emit,
+    private emit: Emit,
   ) {
     const s = this.user.settings
     this.cmdEngine = new CmdScriptEngine(
@@ -121,6 +121,9 @@ export class Session {
       }
     })
   }
+
+  /** Rebind event output to a new WebSocket after a reconnect (see gateway.ts). */
+  setEmit(emit: Emit): void { this.emit = emit }
 
   /** Replay state a freshly-(re)connected client needs (mirrors did-finish-load). */
   replayInitialState(): void {

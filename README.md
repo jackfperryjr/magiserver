@@ -33,7 +33,7 @@ engine + trigger engine), exactly like one Electron window.
   desktop's shared map DB), and Lich frontend **ports** come from a shared pool.
 - **User identity**: today the WS `?user=<account>` param picks the bucket (a
   client-supplied hint). In production, derive it from an authenticated per-user
-  token instead of trusting the client — see Known limitations.
+  token instead of trusting the client.
 
 ### Server-side triggers → push
 
@@ -84,32 +84,6 @@ The renderer's WebSocket `dr.*` transport (the next step) maps each
 `dr.game.send(x)` to an `invoke` and each `dr.game.onData(cb)` to the `game:data`
 event — so the existing React app runs unchanged against this server.
 
-## Run locally
-
-Env comes from the process environment (there is no dotenv). Set the vars in your
-shell, or just deploy to Railway and test there.
-
-```bash
-npm install
-MAGILOOM_SECRET=dev npm run dev   # tsx watch, listens on :8787
-curl localhost:8787/health
-```
-
-Connect a client to `ws://localhost:8787/ws` (no token in dev).
-
-## Deploy to Railway
-
-1. Point a Railway service at this repo (the `Dockerfile` is at the root — Node +
-   Ruby, so Lich can run). No root-directory override needed.
-2. Add a **Volume** mounted at `/data` so `settings.json`, maps, and push
-   subscriptions survive redeploys.
-3. Set Variables: `MAGILOOM_TOKEN`, `MAGILOOM_SECRET`, and the VAPID keys
-   (`npm run vapid`). Railway sets `PORT` for you.
-4. Railway gives you `wss://<app>.up.railway.app/ws?token=...` with TLS.
-
-No Tailscale needed — the token + WSS is your security boundary. (Tailscale would
-only matter if you self-hosted on a home box and wanted it private.)
-
 ## Push notifications (PWA)
 
 Server-side rule evaluation is **wired** (`src/trigger-engine.ts` → `push.notify`),
@@ -122,19 +96,3 @@ Client side (the remaining work, in the renderer):
 4. In the service worker, show the notification on `push`.
 
 iOS requires the PWA be added to the Home Screen for Web Push to work.
-
-## Known limitations (address before going fully public)
-
-- **Multi-Lich needs verification.** Each session now gets a unique frontend port
-  from `port-allocator.ts`, and `lich-manager.ts` passes it via
-  `--detachable-client=<port>` when it differs from 11024. The default single
-  session (11024) is the desktop app's proven path; the custom-port + frostbite
-  combo needs testing against your Lich build. Also: each Lich is a Ruby process
-  (~50-100 MB), so **direct-connect is the scalable default** and Lich is a heavier
-  opt-in — shard Lich users onto worker containers at large scale.
-- **User identity is client-supplied.** `?user=<account>` currently trusts the
-  client to name its bucket. Derive it from an authenticated per-user token before
-  a public launch (otherwise one user could read another's bucket by guessing the
-  name). The shared `MAGILOOM_TOKEN` only gates reaching the server at all.
-- **One `BroadcastBus` poller per active user** (file-based). Fine for now; add
-  refcounted teardown or an in-process bus if user count grows large.

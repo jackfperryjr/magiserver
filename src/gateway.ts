@@ -17,6 +17,13 @@ interface InvokeMsg { t: 'invoke'; id: number; channel: string; args?: unknown[]
 
 const token = process.env['MAGILOOM_TOKEN'] ?? ''
 
+// How long to keep a user's game session (and its live connection to DR) alive
+// after their WebSocket drops, so a backgrounded/minimized app or a network blip
+// can reconnect and resume instead of dropping the character. Tunable via env.
+const GRACE_MS = Number(process.env['MAGILOOM_SESSION_GRACE_MS'] ?? 5 * 60 * 1000)
+
+interface LiveSession { session: Session; grace: ReturnType<typeof setTimeout> | null }
+
 /** Attach the game WebSocket gateway at /ws on an existing HTTP server. */
 export function attachGateway(
   httpServer: HttpServer,
@@ -24,6 +31,9 @@ export function attachGateway(
   server: ServerContext,
 ): void {
   const wss = new WebSocketServer({ noServer: true })
+
+  // One live session per user, retained briefly across reconnects (see GRACE_MS).
+  const sessions = new Map<string, LiveSession>()
 
   httpServer.on('upgrade', (req, socket, head) => {
     // Only handle /ws upgrades; anything else (future routes) is left alone.
@@ -51,14 +61,25 @@ export function attachGateway(
   })
 
   wss.on('connection', (ws: WebSocket, req: { magiloomUser?: string }) => {
+    const userId = req.magiloomUser ?? 'default'
     const emit = (channel: string, ...args: unknown[]) => {
       if (ws.readyState === WebSocket.OPEN) {
         ws.send(JSON.stringify({ t: 'event', channel, args }))
       }
     }
 
-    const userCtx = registry.get(req.magiloomUser ?? 'default')
-    const session = new Session(userCtx, server, emit)
+    // Re-attach to a session kept alive during its grace window (resumes the same
+    // DR connection), else start a fresh one for this user.
+    let live = sessions.get(userId)
+    if (live) {
+      if (live.grace) { clearTimeout(live.grace); live.grace = null }
+      live.session.setEmit(emit)
+    } else {
+      const userCtx = registry.get(userId)
+      live = { session: new Session(userCtx, server, emit), grace: null }
+      sessions.set(userId, live)
+    }
+    const session = live.session
     session.replayInitialState()
 
     ws.on('message', async (raw) => {
@@ -78,7 +99,18 @@ export function attachGateway(
       }
     })
 
-    ws.on('close', () => session.dispose())
-    ws.on('error', () => session.dispose())
+    // On disconnect, DON'T tear the session down immediately — hold it (and its DR
+    // connection) for the grace window so a reconnect resumes. Only dispose if no
+    // reconnect arrives, and only if this exact session is still the current one.
+    const onGone = () => {
+      const cur = sessions.get(userId)
+      if (!cur || cur.session !== session || cur.grace) return
+      cur.grace = setTimeout(() => {
+        if (sessions.get(userId) === cur) sessions.delete(userId)
+        session.dispose()
+      }, GRACE_MS)
+    }
+    ws.on('close', onGone)
+    ws.on('error', onGone)
   })
 }
