@@ -37,9 +37,26 @@ engine + trigger engine), exactly like one Electron window.
   to — so many characters run Lich concurrently, each on its own port (no more
   fighting over Lich's fixed 127.0.0.1:11024 frostbite listener). Set
   `MAGILOOM_LICH_FROSTBITE=1` to fall back to the old one-per-container path.
-- **User identity**: today the WS `?user=<account>` param picks the bucket (a
-  client-supplied hint). In production, derive it from an authenticated per-user
-  token instead of trusting the client.
+- **User identity**: by default the WS `?user=<device>` param picks the bucket and
+  `?conn=<client>` keys the live session (a client-supplied hint). A session is kept
+  alive while its DR connection is up (`MAGILOOM_SESSION_KEEPALIVE_MS`, default 2h)
+  so a backgrounded/closed PWA keeps its character online, push keeps firing, and a
+  reopen resumes the same session.
+- **Accounts (`accounts.ts`)**: real per-user accounts (email + password), enabled
+  with `MAGILOOM_ACCOUNTS_ENABLED=1` (the `/auth/*` routes + the gateway's account
+  path). Two tiers:
+  - **Signed in, any tier** → the DATA bucket is the account (`acct-<id>`), so
+    settings + Lich profiles/custom scripts + avatars **sync across the user's
+    devices** (upload a setup.yaml on a computer, use it on a phone). This is free.
+  - **Paid tier** → the live SESSION is keyed to the account (cross-device **watch
+    mode**) and the gateway keeps it alive across client absence (`keepAlive`), so a
+    backgrounded/closed mobile app stays connected and push keeps firing. Free +
+    anonymous get only the short grace, so their connection drops when they leave.
+
+  Passwords are scrypt-hashed; tokens opaque + revocable; storage is `accounts.json`
+  (no Postgres). No billing yet — `MAGILOOM_PRO_EMAILS="a@b.com,…"` grants the paid
+  tier to listed emails for testing; `setTier(id,'paid')` is the hook a real billing
+  webhook flips. The DESKTOP client never touches any of this (local + free).
 
 ### Server-side triggers → push
 

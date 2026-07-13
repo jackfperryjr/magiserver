@@ -4,6 +4,7 @@ import { UserRegistry } from './user-context'
 import { PortAllocator } from './port-allocator'
 import { attachGateway } from './gateway'
 import type { ServerContext } from './session'
+import { AccountStore } from './accounts'
 import {
   initPush, isPushReady, vapidPublicKey, addSubscription, removeSubscription,
 } from './push'
@@ -23,6 +24,15 @@ const users = new UserRegistry(DATA_DIR)
 const map   = new MapStore(DATA_DIR)
 const ports = new PortAllocator()
 const server: ServerContext = { map, ports, dataDir: DATA_DIR }
+
+// Accounts (paid "watch mode" identity) are built but DORMANT: the /auth endpoints
+// and the gateway's account-keyed sessions only activate with this flag on. Off by
+// default, so nothing here is exposed until we deliberately ship + gate the feature.
+const ACCOUNTS_ENABLED = process.env['MAGILOOM_ACCOUNTS_ENABLED'] === '1'
+// Allowlist of emails granted the paid tier without billing — for testing pro
+// features. e.g. MAGILOOM_PRO_EMAILS="me@example.com,teammate@example.com".
+const PRO_EMAILS = (process.env['MAGILOOM_PRO_EMAILS'] ?? '').split(',')
+const accounts = new AccountStore(DATA_DIR, PRO_EMAILS)
 
 initPush(DATA_DIR)
 
@@ -66,6 +76,39 @@ const httpServer = createServer((req, res) => {
     return
   }
 
+  // ── Accounts (dormant unless MAGILOOM_ACCOUNTS_ENABLED=1) ──────────────────────
+  // Registered only when the flag is on, so the feature is genuinely unexposed by
+  // default — the routes 404 like any unknown path until we turn accounts on.
+  if (ACCOUNTS_ENABLED && url.pathname.startsWith('/auth/')) {
+    const json = (code: number, body: unknown) => {
+      res.writeHead(code, { 'Content-Type': 'application/json', ...cors }); res.end(JSON.stringify(body))
+    }
+    if (url.pathname === '/auth/register' && req.method === 'POST') {
+      readJson(req).then((b) => {
+        const { email, password } = b as { email?: string; password?: string }
+        const r = accounts.register(email ?? '', password ?? '')
+        json(r.ok ? 201 : 400, r)
+      }).catch(() => json(400, { ok: false, error: 'Bad request.' }))
+      return
+    }
+    if (url.pathname === '/auth/login' && req.method === 'POST') {
+      readJson(req).then((b) => {
+        const { email, password } = b as { email?: string; password?: string }
+        const r = accounts.login(email ?? '', password ?? '')
+        if (r) json(200, r); else json(401, { ok: false, error: 'Incorrect email or password.' })
+      }).catch(() => json(400, { ok: false, error: 'Bad request.' }))
+      return
+    }
+    if (url.pathname === '/auth/me' && req.method === 'GET') {
+      const token = (req.headers['authorization'] ?? '').replace(/^Bearer\s+/i, '')
+      const account = accounts.accountForToken(token)
+      if (account) json(200, { ok: true, account }); else json(401, { ok: false, error: 'Not authenticated.' })
+      return
+    }
+    json(404, { ok: false, error: 'Unknown auth route.' })
+    return
+  }
+
   res.writeHead(404, cors); res.end()
 })
 
@@ -78,7 +121,7 @@ function readJson(req: import('http').IncomingMessage): Promise<unknown> {
   })
 }
 
-attachGateway(httpServer, users, server)
+attachGateway(httpServer, users, server, ACCOUNTS_ENABLED ? accounts : null)
 
 httpServer.listen(PORT, () => {
   // eslint-disable-next-line no-console

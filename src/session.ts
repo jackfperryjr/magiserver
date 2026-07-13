@@ -133,6 +133,10 @@ export class Session {
   /** Rebind event output to a new WebSocket after a reconnect (see gateway.ts). */
   setEmit(emit: Emit): void { this.emit = emit }
 
+  /** Whether the DR game socket is live — the gateway keeps abandoned sessions
+   *  alive (so push keeps firing and a reopened app resumes) only while this holds. */
+  isGameConnected(): boolean { return this.gameConn.getStatus() === 'connected' }
+
   /** Replay state a freshly-(re)connected client needs (mirrors did-finish-load). */
   replayInitialState(): void {
     for (const line of this.lichLogBuffer) this.emit('lich:log', line)
