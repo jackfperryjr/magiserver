@@ -40,7 +40,9 @@ interface LiveSession {
 }
 
 /** Extra fields we stash on the upgrade request to carry into the connection. */
-interface ConnReq { magiloomUser?: string; magiloomKey?: string; magiloomPaid?: boolean }
+interface ConnReq {
+  magiloomUser?: string; magiloomKey?: string; magiloomPaid?: boolean; magiloomWatch?: boolean
+}
 
 /** Attach the game WebSocket gateway at /ws on an existing HTTP server.
  *  `accounts` is passed only when MAGILOOM_ACCOUNTS_ENABLED — otherwise null and
@@ -84,54 +86,65 @@ export function attachGateway(
     //   • Signed in (any tier) → the DATA bucket is the ACCOUNT (`acct-<id>`), so
     //     settings, Lich profiles/custom scripts and avatars are shared across every
     //     device the user signs in on. This is the free "sync my setups" benefit.
-    //   • PAID → the live SESSION is keyed by the account ALONE (no conn), so any
-    //     device attaches to the one running DR session (cross-device watch), and the
-    //     gateway keeps it alive across client absence (see keepAlive below).
-    //   • FREE / anonymous → per-device session keyed by conn; no watch, short grace.
+    //   • The live SESSION is ALWAYS keyed per-connection (`…|conn`), signed in or
+    //     not, so a second device/tab NEVER steals the first's game stream (that was
+    //     the hijack). PAID still sets keepAlive so its per-device session survives
+    //     the app being backgrounded/closed. (True cross-device *watch* — several
+    //     clients viewing ONE running session — needs multi-emit + a session picker;
+    //     that's a separate build, not the account-only key that caused the steal.)
     const authToken = url.searchParams.get('auth') ?? ''
     const account = accounts && authToken ? accounts.accountForToken(authToken) : null
     if (account) {
-      const paid = account.tier === 'paid'
       const acctUser = `acct-${account.id}`
-      r.magiloomUser = acctUser
-      r.magiloomKey  = paid ? acctUser : `${acctUser}|${conn}`
-      r.magiloomPaid = paid
+      const paid = account.tier === 'paid'
+      // WATCH mode (paid): attach to ANOTHER of this account's live sessions instead
+      // of this device's own — but only if it actually exists, else fall back to own.
+      // Attaching is non-destructive now (multi-emit broadcasts to every client), so
+      // the watcher mirrors the stream rather than stealing it.
+      const watchConn = url.searchParams.get('watch') ?? ''
+      const useConn = (paid && watchConn && sessions.has(`${acctUser}|${watchConn}`)) ? watchConn : conn
+      r.magiloomUser  = acctUser
+      r.magiloomKey   = `${acctUser}|${useConn}`
+      r.magiloomPaid  = paid
+      r.magiloomWatch = useConn !== conn
     } else {
       const userId = url.searchParams.get('user') ?? 'default'
-      r.magiloomUser = userId
-      r.magiloomKey  = `${userId}|${conn}`
-      r.magiloomPaid = false
+      r.magiloomUser  = userId
+      r.magiloomKey   = `${userId}|${conn}`
+      r.magiloomPaid  = false
+      r.magiloomWatch = false
     }
 
     wss.handleUpgrade(req, socket, head, (ws) => wss.emit('connection', ws, req))
   })
 
   wss.on('connection', (ws: WebSocket, req: ConnReq) => {
-    const userId = req.magiloomUser ?? 'default'
-    const key    = req.magiloomKey ?? userId
-    const paid   = req.magiloomPaid ?? false
+    const userId   = req.magiloomUser ?? 'default'
+    const key      = req.magiloomKey ?? userId
+    const paid     = req.magiloomPaid ?? false
+    const watching = req.magiloomWatch ?? false
     const emit = (channel: string, ...args: unknown[]) => {
       if (ws.readyState === WebSocket.OPEN) {
         ws.send(JSON.stringify({ t: 'event', channel, args }))
       }
     }
 
-    // Re-attach to THIS client's session kept alive during its grace window (resumes
-    // the same DR connection), else start a fresh one. The key is per-connection, so
-    // a different client on the same data bucket never re-attaches here.
+    // Attach to the session for this key (creating it if new). Multiple clients may
+    // attach to one session (a device watching another) — events broadcast to all, so
+    // a newcomer mirrors the stream instead of stealing it. Attaching cancels any
+    // pending grace/keepalive dispose.
     let live = sessions.get(key)
     if (live) {
       if (live.grace) { clearTimeout(live.grace); live.grace = null }
       live.detachedAt = null
       live.keepAlive = live.keepAlive || paid   // a paid client attaching upgrades it
-      live.session.setEmit(emit)
     } else {
       const userCtx = registry.get(userId)
-      live = { session: new Session(userCtx, server, emit), grace: null, detachedAt: null, keepAlive: paid }
+      live = { session: new Session(userCtx, server), grace: null, detachedAt: null, keepAlive: paid }
       sessions.set(key, live)
     }
     const session = live.session
-    session.replayInitialState()
+    const removeClient = session.addClient(emit, watching)
 
     ws.on('message', async (raw) => {
       let msg: InvokeMsg
@@ -142,6 +155,24 @@ export function attachGateway(
       }
       if (msg.t !== 'invoke') return
 
+      // Cross-session query, answered by the gateway (it owns the sessions map): list
+      // this account's live sessions so a paid client can pick one to watch.
+      if (msg.channel === 'session:list') {
+        const prefix = userId + '|'
+        const result: Array<{ conn: string; charName: string; connected: boolean; current: boolean }> = []
+        for (const [k, lv] of sessions) {
+          if (!k.startsWith(prefix)) continue
+          result.push({
+            conn: k.slice(prefix.length),
+            charName: lv.session.getCharName(),
+            connected: lv.session.isGameConnected(),
+            current: k === key,
+          })
+        }
+        ws.send(JSON.stringify({ t: 'result', id: msg.id, ok: true, result }))
+        return
+      }
+
       try {
         const result = await session.invoke(msg.channel, msg.args ?? [])
         ws.send(JSON.stringify({ t: 'result', id: msg.id, ok: true, result }))
@@ -150,14 +181,16 @@ export function attachGateway(
       }
     })
 
-    // On disconnect, hold the session briefly so a quick reconnect resumes. PAID
-    // sessions are additionally held for the long KEEPALIVE window while DR is up —
-    // that's the feature: a backgrounded/closed app keeps its character online, push
-    // keeps firing, and any device resumes/watches it. FREE + anonymous get only the
-    // short GRACE, so their connection drops once they're gone (paywall).
+    // On disconnect, detach THIS client. The session lives on while other clients are
+    // still attached (watchers). Once the LAST client leaves, hold it briefly so a
+    // quick reconnect resumes; PAID sessions are held for the long KEEPALIVE window
+    // while DR is up (backgrounded/closed app stays online, push keeps firing). FREE +
+    // anonymous get only the short GRACE, so their connection drops once gone (paywall).
     const onGone = () => {
+      removeClient()
       const cur = sessions.get(key)
       if (!cur || cur.session !== session || cur.grace) return
+      if (session.hasClients()) return   // other viewers still attached — keep it live
       cur.detachedAt = Date.now()
       const check = () => {
         cur.grace = null

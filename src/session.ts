@@ -46,6 +46,14 @@ export class Session {
   private charName = ''
   private lichPort: number | null = null   // allocated only while Lich is running
 
+  // Every attached client (WebSocket) that should receive this session's events.
+  // Usually one, but several when devices WATCH the same session — events broadcast
+  // to all, so a newcomer mirrors the stream instead of stealing it.
+  private readonly clients = new Set<Emit>()
+  // Recent raw game chunks, replayed to a freshly-attaching WATCH client so it sees
+  // the current room/vitals/scrollback instead of a blank screen until next activity.
+  private readonly recentOutput: string[] = []
+
   // Per-session SGE login continuation (each user logs in independently).
   private pendingSelectInstance:  ((code: string) => Promise<unknown>) | null = null
   private pendingSelectCharacter: ((id: string) => Promise<SGELaunchKey>) | null = null
@@ -57,7 +65,6 @@ export class Session {
   constructor(
     private readonly user: UserContext,
     private readonly server: ServerContext,
-    private emit: Emit,
   ) {
     const s = this.user.settings
     this.cmdEngine = new CmdScriptEngine(
@@ -112,6 +119,8 @@ export class Session {
     this.gameConn.on('disconnected', () => { this.lichLog('[game] Disconnected'); this.emit('game:disconnected') })
     this.gameConn.on('error',        (e: string) => { this.lichLog('[game] Error: ' + e); this.emit('game:error', e) })
     this.gameConn.on('data',         (r: string) => {
+      this.recentOutput.push(r)
+      if (this.recentOutput.length > 200) this.recentOutput.shift()
       this.emit('game:data', r)
       this.cmdEngine.feed(r)
       this.triggers.feed(r)   // server-side alert eval → push
@@ -130,19 +139,36 @@ export class Session {
     })
   }
 
-  /** Rebind event output to a new WebSocket after a reconnect (see gateway.ts). */
-  setEmit(emit: Emit): void { this.emit = emit }
+  /** Broadcast an event to EVERY attached client (multi-viewer / watch mode). */
+  private emit(channel: string, ...args: unknown[]): void {
+    for (const c of this.clients) c(channel, ...args)
+  }
+
+  /**
+   * Attach a client (WebSocket) and replay current state to IT ONLY (not the others),
+   * then return a detach fn. `replayOutput` re-sends the recent game scrollback — set
+   * for a WATCH attach (a fresh viewer that needs context), but not for an ordinary
+   * reconnect of the session's own client, which would just duplicate its output.
+   */
+  addClient(emit: Emit, replayOutput = false): () => void {
+    this.clients.add(emit)
+    for (const line of this.lichLogBuffer) emit('lich:log', line)
+    emit(this.gameConn.getStatus() === 'connected' ? 'game:connected' : 'game:disconnected')
+    emit('lich:status', this.lichMgr.getStatus())
+    if (replayOutput) for (const r of this.recentOutput) emit('game:data', r)
+    return () => { this.clients.delete(emit) }
+  }
+
+  /** True while any client is attached; the gateway starts the grace/keepalive timer
+   *  only once the last one detaches. */
+  hasClients(): boolean { return this.clients.size > 0 }
+
+  /** The connected character's name (for the watch-session picker labels). */
+  getCharName(): string { return this.charName }
 
   /** Whether the DR game socket is live — the gateway keeps abandoned sessions
    *  alive (so push keeps firing and a reopened app resumes) only while this holds. */
   isGameConnected(): boolean { return this.gameConn.getStatus() === 'connected' }
-
-  /** Replay state a freshly-(re)connected client needs (mirrors did-finish-load). */
-  replayInitialState(): void {
-    for (const line of this.lichLogBuffer) this.emit('lich:log', line)
-    this.emit(this.gameConn.getStatus() === 'connected' ? 'game:connected' : 'game:disconnected')
-    this.emit('lich:status', this.lichMgr.getStatus())
-  }
 
   // ── Request/response router (mirrors every ipcMain.handle) ───────────────────
   async invoke(channel: string, args: unknown[]): Promise<unknown> {

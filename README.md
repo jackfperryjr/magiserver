@@ -48,10 +48,15 @@ engine + trigger engine), exactly like one Electron window.
   - **Signed in, any tier** → the DATA bucket is the account (`acct-<id>`), so
     settings + Lich profiles/custom scripts + avatars **sync across the user's
     devices** (upload a setup.yaml on a computer, use it on a phone). This is free.
-  - **Paid tier** → the live SESSION is keyed to the account (cross-device **watch
-    mode**) and the gateway keeps it alive across client absence (`keepAlive`), so a
-    backgrounded/closed mobile app stays connected and push keeps firing. Free +
-    anonymous get only the short grace, so their connection drops when they leave.
+  - The live SESSION is **always keyed per-connection** (`acct-<id>|conn`), signed in
+    or not, so a second device/tab never steals the first's game stream.
+  - **Paid tier** → `keepAlive`: the per-device session survives the app being
+    backgrounded/closed (character stays online, push keeps firing). Free + anonymous
+    get only the short grace, so their connection drops when they leave.
+  - **Cross-device *watch*** (several clients viewing ONE running session) is NOT the
+    account-only session key — that caused a stream-steal hijack. It needs multi-emit
+    (broadcast events to every attached socket) + a session picker, and is a separate
+    build. Deferred.
 
   Passwords are scrypt-hashed; tokens opaque + revocable; storage is `accounts.json`
   (no Postgres). No billing yet — `MAGILOOM_PRO_EMAILS="a@b.com,…"` grants the paid
