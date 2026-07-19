@@ -2,7 +2,12 @@
 #
 # The Ruby base carries Lich; Node.js is layered on for the gateway. Lich itself
 # is CLONED from GitHub at build time (below) — nothing to upload by hand.
-FROM ruby:3.4-slim-bookworm
+#
+# Ruby 4.0+ is required by current Lich 5 (older Ruby aborts at startup with
+# "Your version … of Ruby is too old"). Ruby 4.x images are published on Debian
+# trixie (13), not bookworm (12) — there is no 4.x-slim-bookworm — so this is also
+# a base-OS bump; the apt package names below are unchanged on trixie.
+FROM ruby:4.0-slim-trixie
 
 # Node.js 20 + the C toolchain Lich's native gems (sqlite3, ffi) need to build.
 RUN apt-get update && apt-get install -y --no-install-recommends \
