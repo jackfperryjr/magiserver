@@ -1,7 +1,6 @@
 import { join } from 'path'
 import { SettingsStore } from './lib/settings-store'
 import { BroadcastBus } from './lib/broadcast-bus'
-import { LogStore } from './lib/log-store'
 
 // ── Per-user data isolation ─────────────────────────────────────────────────────
 // The desktop app kept ONE settings.json for a single person (holding several
@@ -22,7 +21,6 @@ export interface UserContext {
   dir:       string
   settings:  SettingsStore
   broadcast: BroadcastBus
-  log:       LogStore
 }
 
 export class UserRegistry {
@@ -44,9 +42,13 @@ export class UserRegistry {
     if (!ctx) {
       const dir = join(this.baseDir, 'users', id)
       const settings = new SettingsStore(dir)
-      const log = new LogStore(dir)
-      log.setEnabled(!!settings.get('logging'))
-      ctx = { userId: id, dir, settings, broadcast: new BroadcastBus(dir), log }
+      // NOTE: the LogStore is deliberately NOT here. Logging is per character, and
+      // one user can run several characters at once (multi-box / link), each in its
+      // own Session — a shared store would let one session's setChar redirect the
+      // other's writes and one character's toggle silently flip the other's. Each
+      // Session owns a LogStore pointed at this same `dir`, so the files still land
+      // in one per-user logs/ directory.
+      ctx = { userId: id, dir, settings, broadcast: new BroadcastBus(dir) }
       this.cache.set(id, ctx)
     }
     return ctx

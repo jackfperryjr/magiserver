@@ -3,7 +3,7 @@ import { LichManager, LichConnection } from './lib/lich-manager'
 import { GameConnection } from './lib/game-connection'
 import { CmdScriptEngine } from './lib/cmd-script-engine'
 import { MapStore, type StoredZone } from './lib/map-store'
-import { stripToLines } from './lib/log-store'
+import { LogStore, logSlug, stripToLines } from './lib/log-store'
 import { sgeAuth, type SGELaunchKey } from './lib/sge-auth'
 import {
   getAvatar, publishAvatar, deleteAvatar, isAvatarServiceEnabled,
@@ -42,6 +42,9 @@ export class Session {
   private readonly cmdEngine: CmdScriptEngine
   private readonly triggers: TriggerEngine
   private readonly lichLogBuffer: string[] = []
+  // Per-session (not per-user): logging is a per-character setting and one user can
+  // play several characters concurrently. Writes into this user's shared logs/ dir.
+  private readonly log: LogStore
 
   private charName = ''
   private lichPort: number | null = null   // allocated only while Lich is running
@@ -67,6 +70,7 @@ export class Session {
     private readonly server: ServerContext,
   ) {
     const s = this.user.settings
+    this.log = new LogStore(this.user.dir)
     this.cmdEngine = new CmdScriptEngine(
       () => s.get('scriptDir') || join(this.user.dir, 'scripts'),
     )
@@ -89,6 +93,12 @@ export class Session {
     this.wireEvents()
   }
 
+  /** Point the log at `charName` and resolve that character's logging flag. */
+  private applyLogging(charName: string): void {
+    this.log.setChar(charName)
+    this.log.setEnabled(this.user.settings.getCharSettings(charName).logging)
+  }
+
   private lichLog(line: string): void {
     this.lichLogBuffer.push(line)
     if (this.lichLogBuffer.length > 200) this.lichLogBuffer.shift()
@@ -97,7 +107,8 @@ export class Session {
 
   // ── Event wiring (mirrors setupIpcHandlers' *.on(...) blocks) ────────────────
   private wireEvents(): void {
-    const { broadcast, log } = this.user
+    const { broadcast } = this.user
+    const log = this.log
     const { map } = this.server
 
     this.lichMgr.on('log',    (l: string) => this.lichLog(l))
@@ -130,7 +141,7 @@ export class Session {
         if (charMatch) {
           this.lichReadyDetected = true
           this.charName = charMatch[1]
-          log.setChar(charMatch[1])
+          this.applyLogging(charMatch[1])   // per-character log file + flag
           this.cmdEngine.setContext({ charname: charMatch[1] })
           this.lichLog('[lich] Character data received -- Lich ready')
           this.emit('lich:status', 'ready')
@@ -190,11 +201,26 @@ export class Session {
       case 'settings:patch': {
         const p = a[0] as Record<string, unknown> | undefined
         s.patch(p ?? {})
-        if (p && 'logging' in p) this.user.log.setEnabled(!!p.logging)
         return
       }
       case 'settings:get-char':   return s.getCharSettings(a[0] as string)
-      case 'settings:patch-char': return s.patchCharSettings(a[0] as string, a[1] as never)
+      case 'settings:patch-char': {
+        const name = a[0] as string
+        const partial = a[1] as Record<string, unknown> | undefined
+        s.patchCharSettings(name, partial as never)
+        // Toggling logging takes effect immediately, but only for the character
+        // this session is actually playing — saving settings for another of the
+        // user's characters (or from another device) must not touch this log.
+        if (partial && 'logging' in partial && this.log.currentChar() === logSlug(name)) {
+          this.log.setEnabled(s.getCharSettings(name).logging)
+        }
+        return
+      }
+
+      // game logs — the PWA's only way to reach them (they live on the server).
+      // Confined to this user's logs/ dir and name-jailed in log-store.ts.
+      case 'logs:list': return this.log.listFiles()
+      case 'logs:read': return this.log.readFile(a[0] as string)
 
       // avatars / portraits
       case 'avatar:enabled': return isAvatarServiceEnabled()
@@ -308,6 +334,10 @@ export class Session {
     this.user.settings.saveAccount(accountName, characterName)
     this.lichReadyDetected = false
     this.charName = characterName
+    // Direct (non-Lich) connections never hit the <app char=…> branch in
+    // wireEvents, so resolve this character's logging flag here; for Lich
+    // sessions the same call runs again once Lich reports the character.
+    this.applyLogging(characterName)
 
     // The "Connect with Lich" login toggle decides this per session; when omitted
     // (older client) fall back to the prior opt-in (the lichPath setting). The
