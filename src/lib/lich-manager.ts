@@ -110,11 +110,15 @@ export class LichManager extends EventEmitter {
   /**
    * Launch Lich fully headless: it self-authenticates from its saved entry.yaml
    * (see lich-home.ts writeLichEntry) via `--login <Char>`, connects to the game
-   * itself, and exposes a detachable client on `listenPort` (`--headless=PORT`
-   * expands to `--without-frontend --detachable-client=PORT`). No primary frontend
-   * and no fixed 127.0.0.1:11024 listener, so any number of sessions coexist — each
-   * on its own port. The caller's GameConnection attaches to `listenPort` with a
-   * plain connect (no key/handshake); Lich streams StormFront XML to it.
+   * itself, and exposes a detachable client on `listenPort`. Headless is expressed
+   * as `--without-frontend --detachable-client=PORT` — the same proven flags Lich
+   * uses in script mode. (An earlier version passed `--headless=PORT`, which is NOT
+   * a real Lich flag: Lich ignored it, defaulted to its GTK frontend, and aborted
+   * demanding the `gtk3` gem — which a headless server image deliberately omits.
+   * `--without-frontend` is what actually drops the frontend and its gem needs.)
+   * No primary frontend and no fixed 127.0.0.1:11024 listener, so any number of
+   * sessions coexist — each on its own port. The caller's GameConnection attaches
+   * to `listenPort` with a plain connect (no key/handshake); Lich streams XML to it.
    */
   spawnHeadless(
     characterName: string,
@@ -137,7 +141,8 @@ export class LichManager extends EventEmitter {
       lichPath,
       '--dragonrealms',
       '--login', characterName,
-      `--headless=${listenPort}`,
+      '--without-frontend',
+      `--detachable-client=${listenPort}`,
     ]
     if (dirs?.home)    args.push(`--home=${dirs.home}`)
     if (dirs?.lib)     args.push(`--lib=${dirs.lib}`)
