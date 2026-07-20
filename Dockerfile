@@ -18,6 +18,7 @@ FROM ruby:4.0-slim-trixie
 RUN apt-get update && apt-get install -y --no-install-recommends \
       curl ca-certificates git build-essential libsqlite3-dev libffi-dev \
       libssl-dev zlib1g-dev pkg-config libgtk-3-dev libgirepository1.0-dev \
+      xvfb xauth \
     && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
     && apt-get install -y --no-install-recommends nodejs \
     && rm -rf /var/lib/apt/lists/*
@@ -29,9 +30,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # system load path where lich.rbw's plain `require`s find them.
 #
 # The gtk group IS installed (only dev/vscode/profanity are skipped): current Lich 5
-# aborts at startup if the gtk3 gem is missing, even though we run --without-frontend
-# and never open a window. The GTK dev headers above let the gem build; the gem loads
-# fine headlessly (requiring the lib needs no X display — only opening a window would).
+# (5.19) both requires the gtk3 gem AND calls Gtk.init at startup unconditionally —
+# there is no headless/without-frontend bypass — so it needs a real X display too.
+# The GTK dev headers above let the gem build; the xvfb/xauth packages above provide
+# the throwaway virtual display Gtk.init needs (Lich is launched under xvfb-run — see
+# lib/lich-manager.ts). Without it Lich aborts with "failed to initialize GTK+".
 #
 # NOTE: baking Lich here is still experimental. A failed build does NOT take down your
 # running deploy (Railway keeps the last good one until a new build succeeds).

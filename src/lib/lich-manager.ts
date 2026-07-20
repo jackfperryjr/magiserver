@@ -114,17 +114,16 @@ export class LichManager extends EventEmitter {
   /**
    * Launch Lich fully headless: it self-authenticates from its saved entry.yaml
    * (see lich-home.ts writeLichEntry) via `--login <Char>`, connects to the game
-   * itself, and exposes a detachable client on `listenPort` via `--headless=PORT`.
-   * No primary frontend and no fixed 127.0.0.1:11024 listener, so any number of
-   * sessions coexist — each on its own port. The caller's GameConnection attaches
-   * to `listenPort` with a plain connect (no key/handshake); Lich streams XML to it.
+   * itself, and exposes a detachable client on `listenPort` via `--without-frontend
+   * --detachable-client=PORT` (Lich's documented headless combo). No primary frontend
+   * and no fixed 127.0.0.1:11024 listener, so any number of sessions coexist — each
+   * on its own port. The caller's GameConnection attaches to `listenPort` with a
+   * plain connect (no key/handshake); Lich streams XML to it.
    *
-   * Flag history: this originally used `--headless=PORT`, which failed only because
-   * Lich then wanted the `gtk3` gem the image lacked. We briefly switched to
-   * `--without-frontend --detachable-client=PORT`, which exited silently. Now that
-   * gtk3 is installed we're back on `--headless=PORT` to see if the original mode
-   * works with the gem present; the log-file surfacing in _spawn makes either
-   * outcome diagnosable.
+   * Flag history: `--headless=PORT` is NOT a real Lich flag — Lich ignored it and ran
+   * its GTK frontend, which (a) demanded the gtk3 gem and (b) never opened an attach
+   * port. gtk3 is now installed and Lich runs under xvfb-run (it calls Gtk.init even
+   * with no frontend — see _spawn), so these documented flags open the port headlessly.
    */
   spawnHeadless(
     characterName: string,
@@ -147,7 +146,8 @@ export class LichManager extends EventEmitter {
       lichPath,
       '--dragonrealms',
       '--login', characterName,
-      `--headless=${listenPort}`,
+      '--without-frontend',
+      `--detachable-client=${listenPort}`,
     ]
     if (dirs?.home)    args.push(`--home=${dirs.home}`)
     if (dirs?.lib)     args.push(`--lib=${dirs.lib}`)
@@ -215,7 +215,15 @@ export class LichManager extends EventEmitter {
   getStatus(): LichStatus { return this.status }
 
   private _spawn(rubyPath: string, args: string[]): void {
-    this.process = spawn(rubyPath, args, { stdio: ['pipe', 'pipe', 'pipe'] })
+    // Lich 5 calls Gtk.init at startup even with no frontend (no headless bypass
+    // exists), so on Linux it needs an X display a server doesn't have. Run it under
+    // xvfb-run, which spins up a throwaway virtual display; `-a` auto-picks a free
+    // display number so concurrent Lich processes never collide. Other platforms
+    // (dev on Windows/macOS) launch ruby directly — they have a real display.
+    const [cmd, cmdArgs] = process.platform === 'linux'
+      ? ['xvfb-run', ['-a', rubyPath, ...args]]
+      : [rubyPath, args]
+    this.process = spawn(cmd, cmdArgs, { stdio: ['pipe', 'pipe', 'pipe'] })
     this.process.stdin?.end()
 
     // Lich's own logging (Lich.log) goes to STDERR, so this is where the "why did
