@@ -10,9 +10,14 @@
 FROM ruby:4.0-slim-trixie
 
 # Node.js 20 + the C toolchain Lich's native gems (sqlite3, ffi) need to build.
+# The libgtk-3-dev + libgirepository1.0-dev stack is for Lich's gtk3 gem: current
+# Lich 5 checks for gtk3 at startup UNCONDITIONALLY (even --without-frontend, which
+# only stops it opening a window, doesn't skip the gem preflight), so the gem must
+# be installable — which needs the GTK/GObject-introspection dev headers. libgtk-3-dev
+# pulls the glib/cairo/pango/gdk-pixbuf -dev deps the ruby-gnome chain builds against.
 RUN apt-get update && apt-get install -y --no-install-recommends \
       curl ca-certificates git build-essential libsqlite3-dev libffi-dev \
-      libssl-dev zlib1g-dev pkg-config \
+      libssl-dev zlib1g-dev pkg-config libgtk-3-dev libgirepository1.0-dev \
     && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
     && apt-get install -y --no-install-recommends nodejs \
     && rm -rf /var/lib/apt/lists/*
@@ -20,17 +25,20 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # --- Shared Lich engine --------------------------------------------------------
 # Read-only base cloned into /opt/lich; each user gets an isolated home seeded
 # from it (src/lich-home.ts). MAGILOOM_LICH_SHARED points the server at it, which
-# lights up the "Connect with Lich" toggle. Lich runs headless in frostbite mode,
-# so skip the GUI (gtk), dev and profanity gem groups. `bundle install` puts the
-# gems on the system load path where lich.rbw's plain `require`s find them.
+# lights up the "Connect with Lich" toggle. `bundle install` puts the gems on the
+# system load path where lich.rbw's plain `require`s find them.
 #
-# NOTE: baking Lich here is still experimental — Lich has not been verified running
-# headless on Linux in this setup. A failed build does NOT take down your running
-# deploy (Railway keeps the last good one until a new build succeeds).
+# The gtk group IS installed (only dev/vscode/profanity are skipped): current Lich 5
+# aborts at startup if the gtk3 gem is missing, even though we run --without-frontend
+# and never open a window. The GTK dev headers above let the gem build; the gem loads
+# fine headlessly (requiring the lib needs no X display — only opening a window would).
+#
+# NOTE: baking Lich here is still experimental. A failed build does NOT take down your
+# running deploy (Railway keeps the last good one until a new build succeeds).
 RUN git clone --depth 1 https://github.com/elanthia-online/lich-5.git /opt/lich \
     && cd /opt/lich \
     && bundle lock --add-platform x86_64-linux \
-    && bundle config set --local without 'development vscode gtk profanity' \
+    && bundle config set --local without 'development vscode profanity' \
     && bundle install
 ENV MAGILOOM_LICH_SHARED=/opt/lich
 
