@@ -1,6 +1,6 @@
 import { ChildProcess, spawn } from 'child_process'
 import { EventEmitter } from 'events'
-import { existsSync } from 'fs'
+import { existsSync, readdirSync, readFileSync, statSync } from 'fs'
 import { join } from 'path'
 import { createConnection, Socket } from 'net'
 
@@ -10,6 +10,10 @@ export class LichManager extends EventEmitter {
   private process:   ChildProcess | null = null
   private status:    LichStatus = 'stopped'
   private pollTimer: ReturnType<typeof setInterval> | null = null
+  // Home dir of the current launch, so a failed exit can surface Lich's own log
+  // files — running --without-frontend, Lich sends its real errors there, not to
+  // the stdout/stderr we capture (hence the otherwise-"silent" exits).
+  private lichHome:  string | null = null
 
   getLichPath(override?: string): string {
     if (override && existsSync(override)) return override
@@ -110,15 +114,17 @@ export class LichManager extends EventEmitter {
   /**
    * Launch Lich fully headless: it self-authenticates from its saved entry.yaml
    * (see lich-home.ts writeLichEntry) via `--login <Char>`, connects to the game
-   * itself, and exposes a detachable client on `listenPort`. Headless is expressed
-   * as `--without-frontend --detachable-client=PORT` — the same proven flags Lich
-   * uses in script mode. (An earlier version passed `--headless=PORT`, which is NOT
-   * a real Lich flag: Lich ignored it, defaulted to its GTK frontend, and aborted
-   * demanding the `gtk3` gem — which a headless server image deliberately omits.
-   * `--without-frontend` is what actually drops the frontend and its gem needs.)
+   * itself, and exposes a detachable client on `listenPort` via `--headless=PORT`.
    * No primary frontend and no fixed 127.0.0.1:11024 listener, so any number of
    * sessions coexist — each on its own port. The caller's GameConnection attaches
    * to `listenPort` with a plain connect (no key/handshake); Lich streams XML to it.
+   *
+   * Flag history: this originally used `--headless=PORT`, which failed only because
+   * Lich then wanted the `gtk3` gem the image lacked. We briefly switched to
+   * `--without-frontend --detachable-client=PORT`, which exited silently. Now that
+   * gtk3 is installed we're back on `--headless=PORT` to see if the original mode
+   * works with the gem present; the log-file surfacing in _spawn makes either
+   * outcome diagnosable.
    */
   spawnHeadless(
     characterName: string,
@@ -141,8 +147,7 @@ export class LichManager extends EventEmitter {
       lichPath,
       '--dragonrealms',
       '--login', characterName,
-      '--without-frontend',
-      `--detachable-client=${listenPort}`,
+      `--headless=${listenPort}`,
     ]
     if (dirs?.home)    args.push(`--home=${dirs.home}`)
     if (dirs?.lib)     args.push(`--lib=${dirs.lib}`)
@@ -150,6 +155,7 @@ export class LichManager extends EventEmitter {
 
     this.emit('log', `Launching Lich (headless, port ${listenPort}): ${rubyPath} ${args.join(' ')}`)
     this.setStatus('starting')
+    this.lichHome = dirs?.home ?? null
     this._spawn(rubyPath, args)
 
     // Lich self-login (SGE + game connect) then opens the detachable port; the
@@ -250,13 +256,47 @@ export class LichManager extends EventEmitter {
         for (const l of tail) this.emit('log', l)
         this.emit('log', '[lich] ── end Lich output ──')
       } else {
-        this.emit('log', '[lich] Lich produced no output before exiting (silent exit — likely the wrong headless launch mode).')
+        this.emit('log', '[lich] Lich produced no output on stdout/stderr — checking its log files…')
       }
+      // Headless Lich logs to files, not the pipes above; surface the newest so a
+      // silent exit is actually diagnosable.
+      this.emitLichLogTail()
       this.emit('log', `[lich] Process ${reason}`)
       this.setStatus('error')
       this.emit('error', `Lich ${reason}. Check the log for details.`)
       this.process = null
     })
+  }
+
+  // After a failed launch, emit the tail of Lich's newest log file. Headless Lich
+  // (--without-frontend) routes its real errors — bad saved login, a Ruby-4 crash,
+  // a GTK/display problem — to files under its home (logs/, temp/, or Lich.log at
+  // the root), never to the stdout/stderr we pipe, so those exits look "silent".
+  private emitLichLogTail(): void {
+    const home = this.lichHome
+    if (!home) return
+    const dirs = [join(home, 'logs'), join(home, 'temp'), home]
+    let newest: { path: string; mtime: number } | null = null
+    for (const d of dirs) {
+      let names: string[]
+      try { names = readdirSync(d) } catch { continue }
+      for (const name of names) {
+        if (!/\.(log|txt)$/i.test(name)) continue
+        try {
+          const p = join(d, name)
+          const st = statSync(p)
+          if (st.isFile() && (!newest || st.mtimeMs > newest.mtime)) newest = { path: p, mtime: st.mtimeMs }
+        } catch { /* skip unreadable */ }
+      }
+    }
+    if (!newest) { this.emit('log', '[lich] No Lich log file found to report.'); return }
+    try {
+      const lines = readFileSync(newest.path, 'utf8').split(/\r?\n/).filter(Boolean)
+      const tail = lines.slice(-40)
+      this.emit('log', `[lich] ── ${newest.path} (last ${tail.length} lines) ──`)
+      for (const l of tail) this.emit('log', `[lichlog] ${l}`)
+      this.emit('log', '[lich] ── end lich log ──')
+    } catch { this.emit('log', `[lich] Could not read ${newest.path}.`) }
   }
 
   private _pollPort(port: number): void {
