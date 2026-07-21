@@ -42,6 +42,7 @@ export const ADMIN_HTML = `<!DOCTYPE html>
   .gate button{width:100%;background:#605dd2;border:none;border-radius:8px;padding:11px;color:#fff;font-weight:600;font-size:14px;cursor:pointer;transition:background .15s}
   .gate button:hover{background:#706de0}
   .gate .err{color:var(--red);font-size:12px;min-height:16px;margin-top:8px}
+  .gate .hint{color:var(--dim);font-size:11px;margin-top:14px;line-height:1.5}
 
   /* tiles */
   .tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:14px;margin-bottom:24px}
@@ -77,10 +78,12 @@ export const ADMIN_HTML = `<!DOCTYPE html>
 
 <div id="gate" class="gate" style="display:none">
   <h1>MAGILOOM</h1>
-  <p>Server metrics — enter the admin key.</p>
-  <input id="key" type="password" placeholder="Admin key" autocomplete="off" />
-  <button id="go">View metrics</button>
+  <p>Server metrics — sign in with your Magiloom admin account.</p>
+  <input id="email" type="email" placeholder="Email" autocomplete="username" />
+  <input id="pass" type="password" placeholder="Password" autocomplete="current-password" />
+  <button id="go">Sign in</button>
   <div id="gateErr" class="err"></div>
+  <div class="hint">First time? Signing in with an authorized email creates your admin account (min. 8-character password).</div>
 </div>
 
 <div id="dash" class="wrap" style="display:none">
@@ -120,16 +123,17 @@ export const ADMIN_HTML = `<!DOCTYPE html>
 
 <script>
 (function(){
-  var KEY_LS = 'magiloom-admin-key';
+  var TOKEN_LS = 'magiloom-admin-token';
   var gate = document.getElementById('gate'), dash = document.getElementById('dash');
-  var keyInput = document.getElementById('key'), gateErr = document.getElementById('gateErr');
+  var emailInput = document.getElementById('email'), passInput = document.getElementById('pass');
+  var gateErr = document.getElementById('gateErr');
   var timer = null;
 
   function showGate(msg){
     if(timer){clearInterval(timer);timer=null;}
     gate.style.display='block'; dash.style.display='none';
     gateErr.textContent = msg || '';
-    keyInput.focus();
+    emailInput.focus();
   }
   function showDash(){ gate.style.display='none'; dash.style.display='block'; }
 
@@ -170,11 +174,11 @@ export const ADMIN_HTML = `<!DOCTYPE html>
   }
 
   function poll(){
-    var key = localStorage.getItem(KEY_LS);
-    if(!key){ showGate(); return; }
-    fetch('/admin/stats?key='+encodeURIComponent(key))
+    var token = localStorage.getItem(TOKEN_LS);
+    if(!token){ showGate(); return; }
+    fetch('/admin/stats',{ headers:{ 'Authorization':'Bearer '+token } })
       .then(function(r){
-        if(r.status===401||r.status===403){ localStorage.removeItem(KEY_LS); showGate('Invalid or disabled admin key.'); throw new Error('auth'); }
+        if(r.status===401||r.status===403){ localStorage.removeItem(TOKEN_LS); showGate('Session expired — sign in again.'); throw new Error('auth'); }
         if(!r.ok) throw new Error('http '+r.status);
         return r.json();
       })
@@ -187,14 +191,25 @@ export const ADMIN_HTML = `<!DOCTYPE html>
 
   function start(){ showDash(); poll(); if(timer)clearInterval(timer); timer=setInterval(poll,4000); }
 
-  document.getElementById('go').onclick=function(){
-    var v=keyInput.value.trim(); if(!v){gateErr.textContent='Enter the admin key.';return;}
-    localStorage.setItem(KEY_LS,v); start();
-  };
-  keyInput.addEventListener('keydown',function(e){ if(e.key==='Enter')document.getElementById('go').click(); });
-  document.getElementById('signout').onclick=function(){ localStorage.removeItem(KEY_LS); showGate(); };
+  function login(){
+    var email=emailInput.value.trim(), pass=passInput.value;
+    if(!email||!pass){ gateErr.textContent='Enter your email and password.'; return; }
+    gateErr.textContent='Signing in…';
+    fetch('/admin/login',{ method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({email:email,password:pass}) })
+      .then(function(r){ return r.json().then(function(d){ return {ok:r.ok,d:d}; }); })
+      .then(function(res){
+        if(res.d && res.d.ok && res.d.token){ localStorage.setItem(TOKEN_LS,res.d.token); passInput.value=''; start(); }
+        else { gateErr.textContent=(res.d && res.d.error) || 'Sign in failed.'; }
+      })
+      .catch(function(){ gateErr.textContent='Server unreachable.'; });
+  }
 
-  if(localStorage.getItem(KEY_LS)) start(); else showGate();
+  document.getElementById('go').onclick=login;
+  passInput.addEventListener('keydown',function(e){ if(e.key==='Enter')login(); });
+  emailInput.addEventListener('keydown',function(e){ if(e.key==='Enter')passInput.focus(); });
+  document.getElementById('signout').onclick=function(){ localStorage.removeItem(TOKEN_LS); showGate(); };
+
+  if(localStorage.getItem(TOKEN_LS)) start(); else showGate();
 })();
 </script>
 </body>
