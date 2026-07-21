@@ -12,6 +12,7 @@ import { ensurePortrait } from './lib/portrait-service'
 import { encryptString, decryptString, isEncryptionAvailable } from './crypto'
 import type { UserContext } from './user-context'
 import type { PortAllocator } from './port-allocator'
+import type { MessageHub } from './message-hub'
 import { TriggerEngine, DEFAULT_PUSH, type NotifRule, type PushConfig } from './trigger-engine'
 import { provisionLichHome, ensureUserScriptsDir, sharedLichRoot, writeLichEntry } from './lich-home'
 import { listFiles, readFile, writeFile, deleteFile } from './lich-files'
@@ -23,6 +24,7 @@ export type Emit = (channel: string, ...args: unknown[]) => void
 export interface ServerContext {
   map: MapStore          // shared community world-map (see user-context.ts)
   ports: PortAllocator   // Lich frontend-port pool (multi-instance support)
+  hub: MessageHub        // server-global messaging presence + router (message-hub.ts)
   dataDir: string
 }
 
@@ -56,6 +58,12 @@ export class Session {
   // Recent raw game chunks, replayed to a freshly-attaching WATCH client so it sees
   // the current room/vitals/scrollback instead of a blank screen until next activity.
   private readonly recentOutput: string[] = []
+  // The room name + description are only sent on room CHANGE, so in a long session
+  // they scroll out of recentOutput — unlike objs/players/exits, which the game
+  // re-sends often. Keep the latest chunk carrying each so a reattaching or watching
+  // client can repopulate the room panel instead of showing exits/objs with no name.
+  private stickyRoomName: string | null = null
+  private stickyRoomDesc: string | null = null
 
   // Per-session SGE login continuation (each user logs in independently).
   private pendingSelectInstance:  ((code: string) => Promise<unknown>) | null = null
@@ -126,12 +134,17 @@ export class Session {
     map.on('zoneChanged',   (zone: StoredZone) => this.emit('map:zone-changed', zone))
 
     this.gameConn.on('log',          (l: string) => this.lichLog('[game] ' + l))
-    this.gameConn.on('connected',    () => { this.lichLog('[game] Connected'); this.emit('game:connected') })
-    this.gameConn.on('disconnected', () => { this.lichLog('[game] Disconnected'); this.emit('game:disconnected') })
+    this.gameConn.on('connected',    () => { this.lichLog('[game] Connected'); this.emit('game:connected'); this.syncPresence() })
+    this.gameConn.on('disconnected', () => { this.lichLog('[game] Disconnected'); this.emit('game:disconnected'); this.syncPresence() })
     this.gameConn.on('error',        (e: string) => { this.lichLog('[game] Error: ' + e); this.emit('game:error', e) })
     this.gameConn.on('data',         (r: string) => {
       this.recentOutput.push(r)
       if (this.recentOutput.length > 200) this.recentOutput.shift()
+      // Remember the latest room name / description chunks (see stickyRoom* above).
+      // Name rides the room streamWindow's " - <Room>" subtitle (or a room-name
+      // component); description is the room-desc component.
+      if (/subtitle=['"] - /.test(r) || /id=['"]room name['"]/.test(r)) this.stickyRoomName = r
+      if (/id=['"]room desc['"]/.test(r)) this.stickyRoomDesc = r
       this.emit('game:data', r)
       this.cmdEngine.feed(r)
       this.triggers.feed(r)   // server-side alert eval → push
@@ -145,6 +158,7 @@ export class Session {
           this.cmdEngine.setContext({ charname: charMatch[1] })
           this.lichLog('[lich] Character data received -- Lich ready')
           this.emit('lich:status', 'ready')
+          this.syncPresence()   // Lich sessions learn the name here (after 'connected')
         }
       }
     })
@@ -166,6 +180,14 @@ export class Session {
     for (const line of this.lichLogBuffer) emit('lich:log', line)
     emit(this.gameConn.getStatus() === 'connected' ? 'game:connected' : 'game:disconnected')
     emit('lich:status', this.lichMgr.getStatus())
+    // Repopulate the sticky room name/description for EVERY attaching client — a
+    // fresh watcher, or our own client after a reload — since these aren't carried
+    // by the frequently-refreshed recentOutput. De-duped in case one chunk held both.
+    // Sent before the scrollback so any newer objs/exits in it still layer on top.
+    const seen = new Set<string>()
+    for (const chunk of [this.stickyRoomName, this.stickyRoomDesc]) {
+      if (chunk && !seen.has(chunk)) { seen.add(chunk); emit('game:data', chunk) }
+    }
     if (replayOutput) for (const r of this.recentOutput) emit('game:data', r)
     return () => { this.clients.delete(emit) }
   }
@@ -174,12 +196,35 @@ export class Session {
    *  only once the last one detaches. */
   hasClients(): boolean { return this.clients.size > 0 }
 
+  /** How many clients/devices are attached (for the metrics dashboard). */
+  clientCount(): number { return this.clients.size }
+
   /** The connected character's name (for the watch-session picker labels). */
   getCharName(): string { return this.charName }
 
   /** Whether the DR game socket is live — the gateway keeps abandoned sessions
    *  alive (so push keeps firing and a reopened app resumes) only while this holds. */
   isGameConnected(): boolean { return this.gameConn.getStatus() === 'connected' }
+
+  /** Push an event to every client attached to this session (all of a character's
+   *  devices). The MessageHub calls this to deliver cross-session messages/presence. */
+  deliver(channel: string, ...args: unknown[]): void { this.emit(channel, ...args) }
+
+  // The character name currently registered with the MessageHub (empty = offline for
+  // messaging). Tracked separately from charName so a name change or a disconnect
+  // re-points presence correctly.
+  private registeredName = ''
+
+  /** Keep the messaging presence registry in step with this session's identity: a
+   *  character is "online" for messaging exactly while its game socket is up under a
+   *  known name. Safe to call repeatedly (connect, character detected, disconnect). */
+  private syncPresence(): void {
+    const name = this.isGameConnected() ? this.charName : ''
+    if (name === this.registeredName) return
+    if (this.registeredName) this.server.hub.deregister(this.registeredName, this)
+    this.registeredName = name
+    if (name) this.server.hub.register(name, this)
+  }
 
   // ── Request/response router (mirrors every ipcMain.handle) ───────────────────
   async invoke(channel: string, args: unknown[]): Promise<unknown> {
@@ -286,6 +331,34 @@ export class Session {
       // broadcast bus (multi-boxing / link) — per user, not server-wide
       case 'broadcast:send':        return this.user.broadcast.send(a[0] as string)
       case 'broadcast:set-receive': return this.user.broadcast.setReceive(a[0] as boolean)
+
+      // ── Magiloom messaging (character-to-character; separate from in-game speech) ──
+      // The actor is ALWAYS the authenticated character name (this.charName) — never
+      // taken from args — so a client can only ever act as the character it logged in
+      // to SGE as. Rejected until a character is connected.
+      case 'contacts:list':
+      case 'contacts:add':
+      case 'contacts:accept':
+      case 'contacts:deny':
+      case 'contacts:remove':
+      case 'msg:history':
+      case 'msg:mark-read':
+      case 'msg:send': {
+        const self = this.charName
+        if (!self) throw new Error('Not connected as a character.')
+        const hub = this.server.hub
+        switch (channel) {
+          case 'contacts:list':   return hub.contacts(self)
+          case 'contacts:add':    return hub.requestContact(self, a[0] as string)
+          case 'contacts:accept': return hub.acceptContact(self, a[0] as string)
+          case 'contacts:deny':   return hub.denyContact(self, a[0] as string)
+          case 'contacts:remove': return hub.removeContact(self, a[0] as string)
+          case 'msg:history':     return hub.history(self, a[0] as string)
+          case 'msg:mark-read':   return hub.markRead(self, a[0] as string)
+          case 'msg:send':        return hub.send(self, a[0] as string, a[1] as string)
+        }
+        return
+      }
 
       // automapper (shared world map)
       case 'map:load':        return this.server.map.loadAll()
@@ -411,6 +484,7 @@ export class Session {
 
   /** Tear down per-session resources (mirrors window-all-closed for one window). */
   dispose(): void {
+    if (this.registeredName) { this.server.hub.deregister(this.registeredName, this); this.registeredName = '' }
     this.loginPassword = null
     this.cmdEngine.stop()
     this.gameConn.disconnect()

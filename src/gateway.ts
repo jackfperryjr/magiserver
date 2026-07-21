@@ -37,7 +37,29 @@ interface LiveSession {
   grace: ReturnType<typeof setTimeout> | null
   detachedAt: number | null   // when the last client dropped (null while attached)
   keepAlive: boolean          // paid: hold across client absence; free: short grace
+  createdAt: number           // when this session first attached (for uptime/metrics)
 }
+
+// ── Live metrics (for /stats + the /admin dashboard) ─────────────────────────────
+/** One session's line in the admin dashboard. Character names are included for the
+ *  OPERATOR's view only — they never appear in the public /stats aggregate. */
+export interface SessionStat {
+  charName:      string
+  gameConnected: boolean
+  clients:       number    // attached devices/watchers
+  paid:          boolean
+  detached:      boolean   // no client attached right now (in grace/keepalive)
+  connectedAt:   number
+}
+export interface GatewaySnapshot {
+  online:        number    // distinct characters with a live game connection ("playing now")
+  playing:       number    // sessions with a live game connection
+  connections:   number    // total attached clients across all sessions
+  totalSessions: number    // sessions held (incl. detached-but-alive)
+  sessions:      SessionStat[]
+}
+/** A gateway exposes a live snapshot of its sessions for the metrics endpoints. */
+export interface GatewayHandle { snapshot(): GatewaySnapshot }
 
 /** Extra fields we stash on the upgrade request to carry into the connection. */
 interface ConnReq {
@@ -52,7 +74,7 @@ export function attachGateway(
   registry: UserRegistry,
   server: ServerContext,
   accounts: AccountStore | null = null,
-): void {
+): GatewayHandle {
   const wss = new WebSocketServer({ noServer: true })
 
   // One live session per CLIENT connection (userId|conn), retained briefly across
@@ -140,7 +162,7 @@ export function attachGateway(
       live.keepAlive = live.keepAlive || paid   // a paid client attaching upgrades it
     } else {
       const userCtx = registry.get(userId)
-      live = { session: new Session(userCtx, server), grace: null, detachedAt: null, keepAlive: paid }
+      live = { session: new Session(userCtx, server), grace: null, detachedAt: null, keepAlive: paid, createdAt: Date.now() }
       sessions.set(key, live)
     }
     const session = live.session
@@ -208,4 +230,39 @@ export function attachGateway(
     ws.on('close', onGone)
     ws.on('error', onGone)
   })
+
+  // Live snapshot of the sessions map for the metrics endpoints (see index.ts).
+  return {
+    snapshot(): GatewaySnapshot {
+      const stats: SessionStat[] = []
+      const onlineNames = new Set<string>()
+      let connections = 0, playing = 0
+      for (const lv of sessions.values()) {
+        const s = lv.session
+        const gameConnected = s.isGameConnected()
+        const clients = s.clientCount()
+        connections += clients
+        if (gameConnected) {
+          playing++
+          const name = s.getCharName()
+          if (name) onlineNames.add(name.toLowerCase())
+        }
+        stats.push({
+          charName:      s.getCharName(),
+          gameConnected,
+          clients,
+          paid:          lv.keepAlive,
+          detached:      lv.detachedAt !== null,
+          connectedAt:   lv.createdAt,
+        })
+      }
+      return {
+        online:        onlineNames.size,
+        playing,
+        connections,
+        totalSessions: sessions.size,
+        sessions:      stats,
+      }
+    },
+  }
 }

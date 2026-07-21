@@ -27,8 +27,9 @@ export interface Account {
   createdAt:    number
 }
 
-/** Account shape safe to return over the wire (no hash). */
-export interface PublicAccount { id: string; email: string; tier: AccountTier }
+/** Account shape safe to return over the wire (no hash). `admin` is derived from the
+ *  MAGILOOM_ADMIN_EMAILS allowlist and gates the /admin metrics dashboard. */
+export interface PublicAccount { id: string; email: string; tier: AccountTier; admin: boolean }
 
 export interface RegisterResult { ok: true; account: PublicAccount; token: string }
 export interface AuthError      { ok: false; error: string }
@@ -47,10 +48,13 @@ export class AccountStore {
   // Emails that are treated as 'paid' regardless of stored tier — a test/allowlist
   // override (MAGILOOM_PRO_EMAILS) so we can grant pro without a billing flow yet.
   private readonly proEmails: Set<string>
+  // Emails granted admin access (the /admin metrics dashboard), via MAGILOOM_ADMIN_EMAILS.
+  private readonly adminEmails: Set<string>
 
-  constructor(dataDir: string, proEmails: string[] = []) {
+  constructor(dataDir: string, proEmails: string[] = [], adminEmails: string[] = []) {
     this.file = join(dataDir, 'accounts.json')
-    this.proEmails = new Set(proEmails.map(e => e.trim().toLowerCase()).filter(Boolean))
+    this.proEmails   = new Set(proEmails.map(e => e.trim().toLowerCase()).filter(Boolean))
+    this.adminEmails = new Set(adminEmails.map(e => e.trim().toLowerCase()).filter(Boolean))
     this.load()
   }
 
@@ -96,7 +100,19 @@ export class AccountStore {
   }
 
   private toPublic(a: Account): PublicAccount {
-    return { id: a.id, email: a.email, tier: this.effectiveTier(a) }
+    return { id: a.id, email: a.email, tier: this.effectiveTier(a), admin: this.adminEmails.has(a.email) }
+  }
+
+  /** Is this email on the admin allowlist? (Checked before creating/claiming an
+   *  admin account, so only allowlisted emails can ever reach the dashboard.) */
+  isAdminEmail(email: string): boolean {
+    return this.adminEmails.has(email.trim().toLowerCase())
+  }
+
+  /** Does an account already exist for this email? Lets the admin-login flow tell
+   *  "wrong password" apart from "first-time claim" without leaking either. */
+  hasEmail(email: string): boolean {
+    return !!this.data.emailIndex[email.trim().toLowerCase()]
   }
 
   // ── Public API ───────────────────────────────────────────────────────────────
