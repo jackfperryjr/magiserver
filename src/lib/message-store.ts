@@ -124,11 +124,14 @@ export class MessageStore {
   removePendingIn(name: string): void  { delete this.data.pendingIn[normName(name)];  this.save() }
   removePendingOut(name: string): void { delete this.data.pendingOut[normName(name)]; this.save() }
 
+  // Removing a contact also deletes the message history with them — the hub calls
+  // this on BOTH sides, so the thread is gone from each party's store.
   removeContact(name: string): void {
     const k = normName(name)
     delete this.data.contacts[k]
     delete this.data.pendingIn[k]
     delete this.data.pendingOut[k]
+    delete this.data.threads[k]
     this.save()
   }
 

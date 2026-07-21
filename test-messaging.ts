@@ -99,11 +99,15 @@ try {
     hub.contacts('Carol').contacts.some(c => c.name === 'Dave') &&
     hub.contacts('Dave').contacts.some(c => c.name === 'Carol'))
 
-  // ── remove contact ──
+  // ── remove contact (also deletes the message history, both sides) ──
+  check('history exists before removal',
+    hub.history('Alice', 'Bob').length > 0 && hub.history('Bob', 'Alice').length > 0)
   hub.removeContact('Alice', 'Bob')
   check('contact removed both sides',
     !hub.contacts('Alice').contacts.some(c => c.name === 'Bob') &&
     !hub.contacts('Bob').contacts.some(c => c.name === 'Alice'))
+  check('message history cleared both sides',
+    hub.history('Alice', 'Bob').length === 0 && hub.history('Bob', 'Alice').length === 0)
   check('cannot message after removal', !hub.send('Alice', 'Bob', 'still there?').ok)
 
   // ── persistence: a fresh store reads what the hub wrote ──
