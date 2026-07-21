@@ -24,6 +24,9 @@ import {
  *  testable with a mock). */
 export interface Deliverable {
   deliver(channel: string, ...args: unknown[]): void
+  /** Optionally web-push an incoming message to this character's devices when their
+   *  app is closed (implemented by Session; absent on test doubles). */
+  maybePushMessage?(fromName: string, body: string): void
 }
 
 export interface Result { ok: boolean; error?: string }
@@ -176,9 +179,17 @@ export class MessageHub {
     // Recipient's copy: delivered now iff they're online to receive the live event.
     peerStore.append({ ...base, read: false, delivered: online })
 
-    if (online) this.emitTo(peer, 'msg:received', base)
+    if (online) {
+      // Deliver live to each of the recipient's sessions, and let each decide whether
+      // to web-push (only when that session has no live client — i.e. the app is shut).
+      const set = this.online.get(normName(peer))
+      if (set) for (const s of set) {
+        s.deliver('msg:received', base)
+        s.maybePushMessage?.(base.from, base.body)
+      }
+    }
     // Mirror to the sender's other devices (the originating client also gets the
-    // return value; clients dedupe by message id).
+    // return value; clients dedupe by message id). No push to the sender.
     this.emitTo(self, 'msg:received', authored)
     return { ok: true, message: authored }
   }

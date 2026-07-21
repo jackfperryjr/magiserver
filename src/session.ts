@@ -16,6 +16,7 @@ import type { MessageHub } from './message-hub'
 import { TriggerEngine, DEFAULT_PUSH, type NotifRule, type PushConfig } from './trigger-engine'
 import { provisionLichHome, ensureUserScriptsDir, sharedLichRoot, writeLichEntry } from './lich-home'
 import { listFiles, readFile, writeFile, deleteFile } from './lich-files'
+import { notify } from './push'
 
 /** Sends an event to the connected client (replaces mainWindow.webContents.send). */
 export type Emit = (channel: string, ...args: unknown[]) => void
@@ -209,6 +210,19 @@ export class Session {
   /** Push an event to every client attached to this session (all of a character's
    *  devices). The MessageHub calls this to deliver cross-session messages/presence. */
   deliver(channel: string, ...args: unknown[]): void { this.emit(channel, ...args) }
+
+  /** Web-push an incoming Magiloom message to this character's devices — but only when
+   *  the app is CLOSED (no client attached), since an open app gets the in-app toast.
+   *  Gated by the user's push opt-in (Settings → Notifications → Direct messages). The
+   *  MessageHub calls this on the recipient's session(s). Mirrors trigger-engine's
+   *  conversation push, keyed to this user so only their devices are pinged. */
+  maybePushMessage(fromName: string, body: string): void {
+    if (this.hasClients()) return
+    const push = (this.user.settings.getAll() as unknown as { push?: PushConfig }).push
+    if (!push?.enabled || !push.message) return
+    const text = body.length > 140 ? body.slice(0, 139) + '…' : body
+    void notify({ title: `Message from ${fromName}`, body: text, tag: 'msg-' + fromName.toLowerCase() }, this.user.userId)
+  }
 
   // The character name currently registered with the MessageHub (empty = offline for
   // messaging). Tracked separately from charName so a name change or a disconnect

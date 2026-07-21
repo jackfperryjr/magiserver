@@ -31,9 +31,10 @@ export interface PushConfig {
   whisper: boolean
   speech:  boolean   // room "says"
   thought: boolean
+  message: boolean   // Magiloom character-to-character messages (see message-hub.ts)
 }
 export const DEFAULT_PUSH: PushConfig = {
-  enabled: false, mention: false, whisper: false, speech: false, thought: false,
+  enabled: false, mention: false, whisper: false, speech: false, thought: false, message: false,
 }
 
 /** Supplies the current rule sets (read fresh each chunk so edits take effect live). */
