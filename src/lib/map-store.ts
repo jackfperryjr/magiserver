@@ -2,7 +2,7 @@ import { EventEmitter } from 'events'
 import { join } from 'path'
 import {
   existsSync, mkdirSync, writeFileSync, readFileSync, readdirSync,
-  unlinkSync, renameSync,
+  unlinkSync, renameSync, copyFileSync, rmSync,
 } from 'fs'
 import { watch } from 'fs'
 
@@ -25,20 +25,33 @@ interface StoredDb   { version: number; zones: Record<string, StoredZone> }
 const WRITE_DEBOUNCE_MS = 700
 const SELF_SUPPRESS_MS  = 1_500
 const DB_VERSION        = 1
+// Periodic snapshots so a bad bulk write or an accidental deletion is recoverable —
+// the map is shared and multi-writer, and there's no other backstop. Hourly, keeping
+// ~2 days of history. Restore is a manual copy of a snapshot dir back over maps/.
+const BACKUP_INTERVAL_MS = 60 * 60 * 1000
+const BACKUP_KEEP        = 48
 
 export class MapStore extends EventEmitter {
   private dir: string
+  private backupDir: string
   private timers   = new Map<string, NodeJS.Timeout>()
   private pending  = new Map<string, StoredZone>()
   private selfWrote = new Map<string, number>()   // filename → ts of our last write
   private watcher: ReturnType<typeof watch> | null = null
+  private backupTimer: NodeJS.Timeout | null = null
 
   constructor(sharedDir: string) {
     super()
     this.dir = join(sharedDir, 'maps')
+    this.backupDir = join(sharedDir, 'maps-backups')
     mkdirSync(this.dir, { recursive: true })
     try { this.watcher = watch(this.dir, (_e, file) => { if (file) this.onExternalChange(file) }) }
     catch { /* watch unsupported — cross-window live sync degrades gracefully */ }
+    // First snapshot shortly after boot (so there's always at least one), then hourly.
+    // unref so neither timer keeps the process alive on shutdown.
+    setTimeout(() => this.backup(), 30_000).unref?.()
+    this.backupTimer = setInterval(() => this.backup(), BACKUP_INTERVAL_MS)
+    this.backupTimer.unref?.()
   }
 
   // Read every zone file into a single DB snapshot (loaded once on startup).
@@ -89,8 +102,37 @@ export class MapStore extends EventEmitter {
     for (const t of this.timers.values()) clearTimeout(t)
     this.timers.clear()
     for (const id of Array.from(this.pending.keys())) this.flushZone(id)
+    if (this.backupTimer) { clearInterval(this.backupTimer); this.backupTimer = null }
     this.watcher?.close()
     this.watcher = null
+  }
+
+  // ── Backups ──────────────────────────────────────────────────────────────────
+  // Snapshot every zone file into maps-backups/<timestamp>/, pruning to the most
+  // recent BACKUP_KEEP. Best-effort: any error is swallowed so a backup hiccup never
+  // disrupts live map serving.
+  private backup(): void {
+    let files: string[]
+    try { files = readdirSync(this.dir).filter(f => f.endsWith('.json')) } catch { return }
+    if (files.length === 0) return   // nothing worth snapshotting
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-')
+    const dest = join(this.backupDir, stamp)
+    try {
+      mkdirSync(dest, { recursive: true })
+      for (const f of files) {
+        try { copyFileSync(join(this.dir, f), join(dest, f)) } catch { /* skip unreadable */ }
+      }
+    } catch { return }
+    this.pruneBackups()
+  }
+
+  private pruneBackups(): void {
+    let snaps: string[]
+    try { snaps = readdirSync(this.backupDir) } catch { return }
+    snaps.sort()   // ISO timestamps sort chronologically — oldest first
+    for (let i = 0; i < snaps.length - BACKUP_KEEP; i++) {
+      try { rmSync(join(this.backupDir, snaps[i]), { recursive: true, force: true }) } catch { /* ignore */ }
+    }
   }
 
   // ── internals ──────────────────────────────────────────────────────────────

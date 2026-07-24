@@ -19,6 +19,12 @@ interface InvokeMsg { t: 'invoke'; id: number; channel: string; args?: unknown[]
 
 const token = process.env['MAGILOOM_TOKEN'] ?? ''
 
+// Require a real Magiloom account (a valid ?auth= token) on every connection — no
+// anonymous ?user= device buckets. Only meaningful with accounts enabled (the
+// gateway is handed a non-null AccountStore); the check below guards on that so a
+// require-without-accounts misconfig can't lock everyone out. See README + index.ts.
+const requireAccount = process.env['MAGILOOM_REQUIRE_ACCOUNT'] === '1'
+
 // How long to keep a user's game session (and its live connection to DR) alive
 // after their WebSocket drops, so a backgrounded/minimized app or a network blip
 // can reconnect and resume instead of dropping the character. Tunable via env.
@@ -116,6 +122,15 @@ export function attachGateway(
     //     that's a separate build, not the account-only key that caused the steal.)
     const authToken = url.searchParams.get('auth') ?? ''
     const account = accounts && authToken ? accounts.accountForToken(authToken) : null
+    // Enforce sign-in: with accounts enabled AND MAGILOOM_REQUIRE_ACCOUNT set, refuse
+    // any connection whose ?auth= didn't resolve to a real account. This is what turns
+    // accounts into an actual security boundary — without it the ?user= device bucket
+    // below is an unauthenticated fallback anyone with the shared token can name.
+    if (requireAccount && accounts && !account) {
+      socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n')
+      socket.destroy()
+      return
+    }
     if (account) {
       const acctUser = `acct-${account.id}`
       const paid = account.tier === 'paid'

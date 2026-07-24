@@ -281,11 +281,20 @@ export class Session {
       case 'logs:list': return this.log.listFiles()
       case 'logs:read': return this.log.readFile(a[0] as string)
 
-      // avatars / portraits
+      // avatars / portraits. Publishing/removing a shared avatar is gated to the
+      // character you're actually connected as — you must be logged in to DR to set
+      // your avatar, and can't claim/alter a name you don't play. (The avatar service
+      // itself only binds names to accounts TOFU-style; this adds character-level proof
+      // on the app path.) portrait:generate stays open — it renders portraits for
+      // anyone you LOOK at, not just yourself.
       case 'avatar:enabled': return isAvatarServiceEnabled()
       case 'avatar:get':     return getAvatar(a[0] as string)
-      case 'avatar:publish': return publishAvatar(s, a[0] as string, a[1] as string)
-      case 'avatar:delete':  return deleteAvatar(s, a[0] as string)
+      case 'avatar:publish':
+        if (!this.isSelf(a[0] as string)) return { ok: false, error: 'Connect as this character to set its avatar.' }
+        return publishAvatar(s, a[0] as string, a[1] as string)
+      case 'avatar:delete':
+        if (!this.isSelf(a[0] as string)) return { ok: false, error: 'Connect as this character to change its avatar.' }
+        return deleteAvatar(s, a[0] as string)
       case 'portrait:generate': return ensurePortrait(a[0] as string, a[1] as string)
 
       // auth / passwords
@@ -374,11 +383,20 @@ export class Session {
         return
       }
 
-      // automapper (shared world map)
+      // automapper (shared world map). This DB is server-global — every user reads
+      // and writes the same zones — so writes are gated to a connected DR character:
+      // a drive-by account (email sign-up, no game login) can't corrupt the community
+      // map, but real players exploring still contribute normally. Reads stay open
+      // (it's just world geography). Wiping the whole shared DB is never a remote
+      // action — it's operator-only (filesystem), so map:clear is a no-op here.
       case 'map:load':        return this.server.map.loadAll()
-      case 'map:save-zone':   return this.server.map.saveZone(a[0] as StoredZone)
-      case 'map:delete-zone': return this.server.map.deleteZone(a[0] as string)
-      case 'map:clear':       return this.server.map.clearAll()
+      case 'map:save-zone':
+        if (!this.charName) throw new Error('Connect a character before editing the map.')
+        return this.server.map.saveZone(a[0] as StoredZone)
+      case 'map:delete-zone':
+        if (!this.charName) throw new Error('Connect a character before editing the map.')
+        return this.server.map.deleteZone(a[0] as string)
+      case 'map:clear':       return   // disabled remotely — shared DB, operator-only
       case 'map:export':      return { ok: false, error: 'Export happens client-side on the web build.' }
 
       default:
@@ -487,6 +505,14 @@ export class Session {
   /** Ensure this user's writable Lich dirs exist and return their scripts dir. */
   private userScriptsDir(): string {
     return ensureUserScriptsDir(this.server.dataDir, this.user.userId)
+  }
+
+  /** True when `name` is the character this session is currently connected as
+   *  (case-insensitive). Guards avatar writes: you can only set the avatar of the
+   *  character you're logged in to DR as, so a name you don't play can't be claimed. */
+  private isSelf(name: string): boolean {
+    const self = this.charName.trim().toLowerCase()
+    return !!self && (name ?? '').trim().toLowerCase() === self
   }
 
   /** Stop Lich and return its port to the pool. */

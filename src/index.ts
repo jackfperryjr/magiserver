@@ -232,6 +232,10 @@ httpServer.listen(PORT, () => {
     // eslint-disable-next-line no-console
     console.warn('[magiloom-server] MAGILOOM_TOKEN is not set — the /ws gateway is OPEN. Set it before exposing this server.')
   }
+  if (process.env['MAGILOOM_REQUIRE_ACCOUNT'] === '1' && !ACCOUNTS_ENABLED) {
+    // eslint-disable-next-line no-console
+    console.warn('[magiloom-server] MAGILOOM_REQUIRE_ACCOUNT=1 but MAGILOOM_ACCOUNTS_ENABLED is off — account enforcement is INACTIVE (no account layer to enforce). Set MAGILOOM_ACCOUNTS_ENABLED=1.')
+  }
 })
 
 function shutdown(): void {
