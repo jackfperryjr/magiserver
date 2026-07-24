@@ -161,9 +161,33 @@ export function attachGateway(
       live.detachedAt = null
       live.keepAlive = live.keepAlive || paid   // a paid client attaching upgrades it
     } else {
-      const userCtx = registry.get(userId)
-      live = { session: new Session(userCtx, server), grace: null, detachedAt: null, keepAlive: paid, createdAt: Date.now() }
-      sessions.set(key, live)
+      // Session adoption. The live-session key is `${bucket}|${conn}`, and `conn` is a
+      // STABLE per-client id (localStorage) while the bucket flips device↔account when
+      // the SAME client signs in or out. So on a re-bucketing reconnect there may be a
+      // running session for this exact conn under the OLD bucket — re-key it to the new
+      // bucket instead of dropping the character. This is what lets a player start DR
+      // anonymously and then sign into their Magiloom account (or sign out) without
+      // re-logging-in. conn is unguessable and unique per client, so this only ever
+      // matches the client's own prior session. Skipped in watch mode (that key already
+      // resolved to the watched session above, so `live` was truthy).
+      const connSuffix = key.slice(key.indexOf('|'))   // "|<conn>"
+      let adoptedKey: string | undefined
+      for (const k of sessions.keys()) {
+        if (k !== key && k.endsWith(connSuffix)) { adoptedKey = k; break }
+      }
+      const adopted = adoptedKey ? sessions.get(adoptedKey) : undefined
+      if (adopted && adoptedKey) {
+        if (adopted.grace) { clearTimeout(adopted.grace); adopted.grace = null }
+        adopted.detachedAt = null
+        adopted.keepAlive = adopted.keepAlive || paid
+        sessions.delete(adoptedKey)
+        sessions.set(key, adopted)
+        live = adopted
+      } else {
+        const userCtx = registry.get(userId)
+        live = { session: new Session(userCtx, server), grace: null, detachedAt: null, keepAlive: paid, createdAt: Date.now() }
+        sessions.set(key, live)
+      }
     }
     const session = live.session
     const removeClient = session.addClient(emit, watching)
