@@ -344,6 +344,11 @@ export class Session {
 
       // game
       case 'game:get-status': return this.gameConn.getStatus()
+      // The character this session is ACTUALLY connected as — the authoritative
+      // identity a resuming web client must trust over its own saved settings (a
+      // reload can't be told which of several characters this conn is running, and
+      // account-shared settings drift across devices). Empty until the name is known.
+      case 'game:get-char':   return this.charName
       case 'game:disconnect': return this.gameConn.disconnect()
       case 'game:send': {
         this.gameConn.send(a[0] as string)
