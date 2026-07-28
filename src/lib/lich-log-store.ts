@@ -49,6 +49,18 @@ export function lichLogsDir(lichHome: string): string {
   return join(lichHome, 'logs')
 }
 
+export interface ListLichOptions {
+  limit?: number
+  /**
+   * Only the raw-stream `.xml`, which is the default and what the analyzer wants.
+   * The `.log` beside it is the same session flattened with no per-line timestamps,
+   * so nothing can be measured from it — and on a real install it's the MAJORITY of
+   * the files (2,464 files, only 466 of them .xml), so including them would spend
+   * most of the response budget on entries no caller can use.
+   */
+  xmlOnly?: boolean
+}
+
 /**
  * List a user's Lich logs, newest first.
  *
@@ -56,7 +68,8 @@ export function lichLogsDir(lichHome: string): string {
  * time it reconnects, so an active account accumulates thousands, and neither the
  * response nor the picker wants all of them.
  */
-export function listLichLogs(lichHome: string, limit = 500): LichLogEntry[] {
+export function listLichLogs(lichHome: string, opts: ListLichOptions = {}): LichLogEntry[] {
+  const { limit = 500, xmlOnly = true } = opts
   const root = lichLogsDir(lichHome)
   if (!existsSync(root)) return []
 
@@ -73,6 +86,7 @@ export function listLichLogs(lichHome: string, limit = 500): LichLogEntry[] {
         for (const file of safeList(join(root, charDir, year, month))) {
           const rel = `${charDir}/${year}/${month}/${file}`
           if (!LICH_PATH_RE.test(rel)) continue
+          if (xmlOnly && !file.toLowerCase().endsWith('.xml')) continue
           try {
             const st = statSync(join(root, charDir, year, month, file))
             if (!st.isFile()) continue
