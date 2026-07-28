@@ -9,6 +9,8 @@ import { ADMIN_HTML } from './admin-page'
 import type { ServerContext } from './session'
 import { AccountStore } from './accounts'
 import { LogStore } from './lib/log-store'
+import { listLichLogs, readLichLog } from './lib/lich-log-store'
+import { userLichHome } from './lich-home'
 import {
   initPush, isPushReady, vapidPublicKey, addSubscription, removeSubscription,
 } from './push'
@@ -258,7 +260,8 @@ const httpServer = createServer((req, res) => {
   //     joins it to that directory, so traversal has nowhere to go.
   // Logs can contain private conversation, so this stays account-only forever —
   // don't add a shared-token path to it later.
-  if (ACCOUNTS_ENABLED && (url.pathname === '/logs' || url.pathname === '/logs/read' || url.pathname === '/logs/events')) {
+  if (ACCOUNTS_ENABLED && (url.pathname === '/logs' || url.pathname === '/logs/read' ||
+                           url.pathname === '/logs/events' || url.pathname === '/logs/lich')) {
     const json = (code: number, body: unknown) => {
       res.writeHead(code, { 'Content-Type': 'application/json', ...cors }); res.end(JSON.stringify(body))
     }
@@ -271,8 +274,23 @@ const httpServer = createServer((req, res) => {
     // sessions wrote — see gateway.ts (`acct-${account.id}`).
     const store = new LogStore(users.get(`acct-${account.id}`).dir)
 
+    // Both kinds of log this account has on the server. Magiloom's own (flat, one per
+    // character per day) and, when the server has been running Lich for them, Lich's
+    // — which are the better record, since nothing has been flattened out of them.
     if (url.pathname === '/logs') {
-      json(200, { ok: true, files: store.listFiles() })
+      let lich: ReturnType<typeof listLichLogs> = []
+      try { lich = listLichLogs(userLichHome(DATA_DIR, `acct-${account.id}`)) } catch { /* none */ }
+      json(200, { ok: true, files: store.listFiles(), lich })
+      return
+    }
+
+    if (url.pathname === '/logs/lich') {
+      const rel = url.searchParams.get('path') ?? ''
+      try {
+        json(200, { ok: true, ...readLichLog(userLichHome(DATA_DIR, `acct-${account.id}`), rel) })
+      } catch {
+        json(404, { ok: false, error: 'No such log.' })
+      }
       return
     }
 

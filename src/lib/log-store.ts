@@ -1,6 +1,6 @@
 import { join } from 'path'
 import { mkdirSync, appendFileSync, existsSync, readdirSync, statSync, openSync, readSync, closeSync } from 'fs'
-import { StreamEventExtractor, toJsonl, EVENT_FORMAT_VERSION } from './stream-events'
+import { StreamEventExtractor, toJsonl, EVENT_FORMAT_VERSION, stripToLines } from './stream-events'
 
 // ── Optional game-output file logging ───────────────────────────────────────────
 // Off by default (toggled in Settings). When on, appends the visible game text to a
@@ -199,11 +199,9 @@ export interface LogFileRead {
   truncated: boolean
 }
 
-// Strip XML tags + decode the few entities DR uses, yielding plain visible lines.
-export function stripToLines(rawChunk: string): string[] {
-  return rawChunk
-    .replace(/<[^>]+>/g, '\n')
-    .replace(/&gt;/g, '>').replace(/&lt;/g, '<').replace(/&amp;/g, '&')
-    .replace(/&quot;/g, '"').replace(/&apos;/g, "'")
-    .split('\n')
-}
+// Re-exported from stream-events, where it now lives. It is pure string handling with
+// no filesystem in sight, and THIS module imports fs and path — so anything in a
+// browser bundle that wanted stripToLines (the Lich log reader does) was dragging all
+// of node's built-ins in behind it. Kept exported here because callers already import
+// it from this module.
+export { stripToLines } from './stream-events'

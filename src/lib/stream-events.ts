@@ -38,10 +38,39 @@ export const EVENT_FORMAT_VERSION = 1
 const EXP_RE   = /:?\s*(\d+)\s+(\d+)%\s+(?:([a-zA-Z][a-zA-Z ]*?)\s+)?[[(]\s*(\d+\/\d+)\s*[\])]/
 const TDP_RE   = /TDPs?:\s*(\d+)/i
 const FAVOR_RE = /Favors?:\s*(\d+)/i
-const ID_RE    = /\bid=['"]([^'"]*)['"]/i
+// Attribute values are matched to their OWN closing quote via a backreference, not to
+// "any quote". DR is full of apostrophes — Vela'Tohr Woods, Ain Ghazal, Mo'ur — and a
+// naive [^'"]* stops dead at the first one, so subtitle=" - [Vela'Tohr Woods, Blighted
+// Tangle]" silently became " - [Vela". Room names were being truncated mid-word.
+const ID_RE       = /\bid=(['"])(.*?)\1/i
+const SUBTITLE_RE = /\bsubtitle=(['"])(.*?)\1/i
+
+/**
+ * `exp`-prefixed component ids that are NOT skills. The experience window carries a
+ * few summary rows alongside the skills; `favor` and `tdp` are read as totals below,
+ * and the others hold prose or nothing at all.
+ */
+const NON_SKILL_EXP_IDS = new Set(['tdp', 'favor', 'rexp', 'sleep'])
 
 /** Longest tag fragment we'll hold across reads before deciding it isn't a tag. */
 const MAX_PENDING = 4096
+
+/**
+ * Strip a room title down to its name.
+ *
+ * DR sends "[Crossing, Town Square]". Lich, acting as proxy, appends its own room id:
+ * "[Kaal Utewg, Old Growth] (4219310)", or "(**)" when it can't identify the room. The
+ * closing bracket is therefore NOT at the end of the string, so trimming a trailing "]"
+ * leaves the id and half the punctuation attached — room names read as
+ * "Kaal Utewg, Old Growth] (4219310)" and the same room logged through Lich and
+ * through Magiloom would count as two different places.
+ */
+function cleanRoomName(raw: string): string {
+  return raw.trim()
+    .replace(/^\[/, '')
+    .replace(/\]\s*(?:\(\s*(?:\d+|\*+)\s*\))?\s*$/, '')
+    .trim()
+}
 
 function decodeEntities(s: string): string {
   return s.replace(/&gt;/g, '>').replace(/&lt;/g, '<')
@@ -56,16 +85,20 @@ function decodeEntities(s: string): string {
  */
 export class StreamEventExtractor {
   private expSkill = ''      // non-empty while inside <component id='exp X'>
+  private expIsSkill = true  // false for the summary rows (tdp, favor, rexp, sleep)
   private inRoom   = false   // inside <component id='room name'>
   private buf      = ''      // text collected inside whichever of those is open
   private pending  = ''      // a trailing fragment of a tag split across reads
+  private lastRoom = ''      // dedup — see the streamWindow note in handleTag
 
   /** Drop all partial state — call when the connection resets. */
   reset(): void {
     this.expSkill = ''
+    this.expIsSkill = true
     this.inRoom = false
     this.buf = ''
     this.pending = ''
+    this.lastRoom = ''
   }
 
   /**
@@ -111,6 +144,26 @@ export class StreamEventExtractor {
   private handleTag(raw: string, now: number, out: StreamEvent[]): void {
     const closing = raw.startsWith('</')
     const name = (closing ? raw.slice(2) : raw.slice(1)).match(/^[a-zA-Z][\w:-]*/)?.[0]?.toLowerCase()
+
+    // ── Room name, the way DR actually sends it ─────────────────────────────────
+    // The primary source is an ATTRIBUTE — <streamWindow id='room' subtitle=' - [Crossing,
+    // Town Square]'> — not element text. That distinction is the whole reason the sidecar
+    // has to exist for rooms: flattening the stream to text deletes attributes outright,
+    // so a room name never appears in the text log at all and nothing can recover it
+    // afterwards. The same subtitle rides both the id='main' and id='room' windows, so
+    // emit only on change (mirroring sge-parser's _lastRoomName).
+    if (name === 'streamwindow' && !closing) {
+      const subtitle = decodeEntities(SUBTITLE_RE.exec(raw)?.[2] ?? '')
+      if (subtitle.startsWith(' - ')) {
+        const room = cleanRoomName(subtitle.slice(3))
+        if (room && room !== this.lastRoom) {
+          this.lastRoom = room
+          out.push({ t: now, e: 'room', name: room })
+        }
+      }
+      return
+    }
+
     if (name !== 'component') return
 
     if (closing) {
@@ -120,7 +173,7 @@ export class StreamEventExtractor {
         const skill = this.expSkill
         this.expSkill = ''
         this.buf = ''
-        const em = EXP_RE.exec(text)
+        const em = this.expIsSkill ? EXP_RE.exec(text) : null
         if (em) {
           out.push({
             t: now, e: 'exp', skill,
@@ -145,9 +198,14 @@ export class StreamEventExtractor {
       if (this.inRoom) {
         this.inRoom = false
         this.buf = ''
-        // Room titles arrive bracketed: "[Crossing, Town Square]".
-        const stripped = text.replace(/^\[|\]$/g, '').trim()
-        if (stripped) out.push({ t: now, e: 'room', name: stripped })
+        // The secondary source: <component id='room name'>[Crossing, Town Square]</component>.
+        // Deduped against the streamWindow subtitle above, since a single move can
+        // deliver the name both ways and that would count as two visits.
+        const stripped = cleanRoomName(text)
+        if (stripped && stripped !== this.lastRoom) {
+          this.lastRoom = stripped
+          out.push({ t: now, e: 'room', name: stripped })
+        }
       }
       return
     }
@@ -155,11 +213,17 @@ export class StreamEventExtractor {
     // Opening <component>: start capturing only for the two ids we care about, and
     // close out any component still open (a missing </component> must not make the
     // buffer grow without bound).
-    const id = (ID_RE.exec(raw)?.[1] ?? '').trim()
+    const id = (ID_RE.exec(raw)?.[2] ?? '').trim()
     this.expSkill = ''
     this.inRoom = false
     this.buf = ''
-    if (/^exp\s+/i.test(id)) this.expSkill = id.replace(/^exp\s+/i, '').trim()
+    if (/^exp\s+/i.test(id)) {
+      const name = id.replace(/^exp\s+/i, '').trim()
+      // `exp tdp` and `exp favor` still need capturing — they carry the totals — but
+      // they must never be reported as a skill named "tdp".
+      this.expSkill = name
+      this.expIsSkill = !NON_SKILL_EXP_IDS.has(name.toLowerCase())
+    }
     else if (id.toLowerCase() === 'room name') this.inRoom = true
   }
 }
@@ -184,4 +248,21 @@ export function parseJsonl(content: string): StreamEvent[] {
     } catch { /* skip a partial or corrupt line */ }
   }
   return out
+}
+
+/**
+ * Strip XML tags and decode the few entities DR uses, yielding plain visible lines.
+ * Every tag becomes a line break — which is what makes the text log readable, and also
+ * what throws the attributes away (see the room-name note above).
+ *
+ * Lives here rather than in log-store because it is pure string handling: log-store
+ * imports fs and path, and importing this from there pulled node built-ins into the
+ * browser bundle that reads Lich logs.
+ */
+export function stripToLines(rawChunk: string): string[] {
+  return rawChunk
+    .replace(/<[^>]+>/g, '\n')
+    .replace(/&gt;/g, '>').replace(/&lt;/g, '<').replace(/&amp;/g, '&')
+    .replace(/&quot;/g, '"').replace(/&apos;/g, "'")
+    .split('\n')
 }
