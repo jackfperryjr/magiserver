@@ -3,7 +3,7 @@ import { LichManager, LichConnection } from './lib/lich-manager'
 import { GameConnection } from './lib/game-connection'
 import { CmdScriptEngine } from './lib/cmd-script-engine'
 import { MapStore, type StoredZone } from './lib/map-store'
-import { LogStore, logSlug, stripToLines } from './lib/log-store'
+import { LogStore, logSlug } from './lib/log-store'
 import { sgeAuth, type SGELaunchKey } from './lib/sge-auth'
 import {
   getAvatar, publishAvatar, deleteAvatar, isAvatarServiceEnabled,
@@ -149,7 +149,7 @@ export class Session {
       this.emit('game:data', r)
       this.cmdEngine.feed(r)
       this.triggers.feed(r)   // server-side alert eval → push
-      if (log.isEnabled()) for (const line of stripToLines(r)) log.writeLine(line)
+      log.write(r)   // text log + structured sidecar; no-ops when logging is off
       if (!this.lichReadyDetected) {
         const charMatch = /<app[^>]+char=["']([^"']+)["']/.exec(r)
         if (charMatch) {
