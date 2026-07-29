@@ -1,0 +1,41 @@
+name: Checks
+
+# The gate on every PR to main. This repo had no CI at all before this, so a PR could
+# only be verified by reading it.
+#
+# Typecheck + build only for now: there is no linter and no test suite here yet. Both
+# are worth adding, and this file is where they'd hang off once they exist.
+#
+# Node 20 matches production deliberately — the Dockerfile installs Node via
+# nodesource setup_20.x, so CI compiling under a different major would defeat the
+# point of the build step. Keep these two in sync.
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [ main ]
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      # Compiles src/ to dist/ exactly as the Docker image does, so a build break is
+      # caught here rather than at deploy time on Railway.
+      - name: Build
+        run: npm run build
