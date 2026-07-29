@@ -3,8 +3,8 @@ name: Checks
 # The gate on every PR to main. This repo had no CI at all before this, so a PR could
 # only be verified by reading it.
 #
-# Typecheck + build only for now: there is no linter and no test suite here yet. Both
-# are worth adding, and this file is where they'd hang off once they exist.
+# Typecheck, tests, build. There is no linter here yet; this file is where it would
+# hang off once one exists.
 #
 # Node 20 matches production deliberately — the Dockerfile installs Node via
 # nodesource setup_20.x, so CI compiling under a different major would defeat the
@@ -34,6 +34,12 @@ jobs:
 
       - name: Typecheck
         run: npm run typecheck
+
+      # Drives MessageHub end-to-end against mock sessions — presence, contact
+      # requests, delivery, the offline queue, and on-disk persistence. No framework;
+      # the script asserts in plain code and exits non-zero on failure.
+      - name: Tests
+        run: npm test
 
       # Compiles src/ to dist/ exactly as the Docker image does, so a build break is
       # caught here rather than at deploy time on Railway.
