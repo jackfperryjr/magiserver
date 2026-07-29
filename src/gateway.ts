@@ -271,6 +271,12 @@ export function attachGateway(
   })
 
   // Live snapshot of the sessions map for the metrics endpoints (see index.ts).
+  //
+  // Reports GAME sessions, not WebSocket clients. A Session object is built for every
+  // connecting client (see wss.on('connection') above), so the raw map also contains
+  // apps parked on the login screen and apps that have disconnected — neither is
+  // anyone playing, and listing them showed a permanent phantom "(logging in…)" row.
+  // Session.isSessionActive() is the flag that separates the two.
   return {
     snapshot(): GatewaySnapshot {
       const stats: SessionStat[] = []
@@ -279,6 +285,7 @@ export function attachGateway(
       for (const lv of sessions.values()) {
         const s = lv.session
         const gameConnected = s.isGameConnected()
+        if (!gameConnected && !s.isSessionActive()) continue   // idle client, not a session
         const clients = s.clientCount()
         connections += clients
         if (gameConnected) {
@@ -299,7 +306,7 @@ export function attachGateway(
         online:        onlineNames.size,
         playing,
         connections,
-        totalSessions: sessions.size,
+        totalSessions: stats.length,   // game sessions, not raw map size (idle clients)
         sessions:      stats,
       }
     },

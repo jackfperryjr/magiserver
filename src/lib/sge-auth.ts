@@ -32,6 +32,14 @@ export type SGEInstanceResult =
       ok:               true
       characters:       SGECharacter[]
       selectCharacter:  (id: string) => Promise<SGELaunchKey>
+      /**
+       * Drop this SGE session WITHOUT requesting a launch key. Used when headless
+       * Lich will run its own login: `L` reserves the character's one live launch
+       * key, so asking for one we then discard leaves two claims on the same
+       * character seconds apart and the game server refuses the loser with
+       * "Invalid login key. Please relogin to the web site."
+       */
+      close:            () => void
     }
   | { ok: false; error: string }
 
@@ -238,7 +246,8 @@ function selectInstance(
           resolve({
             ok: true,
             characters,
-            selectCharacter: (charId: string) => selectCharacter(sock, charId, onLog)
+            selectCharacter: (charId: string) => selectCharacter(sock, charId, onLog),
+            close: () => { try { sock.destroy() } catch { /* already closed */ } },
           })
           break
         }

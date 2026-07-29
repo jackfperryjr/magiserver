@@ -69,6 +69,9 @@ export class Session {
   // Per-session SGE login continuation (each user logs in independently).
   private pendingSelectInstance:  ((code: string) => Promise<unknown>) | null = null
   private pendingSelectCharacter: ((id: string) => Promise<SGELaunchKey>) | null = null
+  // Drops the open SGE socket without requesting a launch key — see selectCharacter's
+  // headless branch, where Lich performs the login instead of us.
+  private pendingSelectClose:     (() => void) | null = null
   private lichReadyDetected = false
   // Held only between login() and selectCharacter() so headless Lich can write its
   // saved-login entry.yaml; cleared right after (never persisted in the session).
@@ -210,6 +213,19 @@ export class Session {
   /** Whether the DR game socket is live — the gateway keeps abandoned sessions
    *  alive (so push keeps firing and a reopened app resumes) only while this holds. */
   isGameConnected(): boolean { return this.gameConn.getStatus() === 'connected' }
+
+  /**
+   * Whether this session is holding (or actively establishing) a DR connection.
+   *
+   * The gateway builds ONE Session per WebSocket the moment a client connects, long
+   * before anyone logs in — so "a Session exists" says nothing about whether anyone
+   * is playing. This is the flag that does: set when a character connect begins,
+   * cleared by endSession(). The metrics endpoints list only sessions where this or
+   * isGameConnected() holds, so an app parked on the login screen (or one that just
+   * disconnected) stops showing up as a phantom "(logging in…)" row.
+   */
+  isSessionActive(): boolean { return this.gameSessionActive }
+  private gameSessionActive = false
 
   /** Push an event to every client attached to this session (all of a character's
    *  devices). The MessageHub calls this to deliver cross-session messages/presence. */
@@ -428,27 +444,27 @@ export class Session {
     const result = await (this.pendingSelectInstance as (c: string) => Promise<{
       ok: boolean; error?: string; characters?: unknown[]
       selectCharacter?: (id: string) => Promise<SGELaunchKey>
+      close?: () => void
     }>)(code)
     if (!result.ok) return result
     this.pendingSelectCharacter = result.selectCharacter ?? null
+    this.pendingSelectClose     = result.close ?? null
     return { ok: true, characters: result.characters }
   }
 
   private async selectCharacter(
     characterId: string, characterName: string, accountName: string, useLich?: boolean,
   ): Promise<unknown> {
-    if (!this.pendingSelectCharacter) return { ok: false, error: 'Session expired.' }
-    let key: SGELaunchKey
-    try {
-      key = await this.pendingSelectCharacter(characterId)
-    } catch (e) {
-      return { ok: false, error: String(e) }
-    }
+    const fetchKey = this.pendingSelectCharacter
+    if (!fetchKey) return { ok: false, error: 'Session expired.' }
     this.pendingSelectCharacter = null
     // Fully end the PREVIOUS session first — this path also runs for an in-app
     // character switch, where the old socket and old Lich are still live. Frees the
     // old Lich's pooled port before we acquire a new one below.
     this.endSession()
+    // From here we're holding a game session, so the metrics endpoints should show it
+    // (as "(logging in…)" until the character name is parsed). Cleared by endSession.
+    this.gameSessionActive = true
     this.user.settings.saveAccount(accountName, characterName)
     this.lichReadyDetected = false
     this.charName = characterName
@@ -463,55 +479,79 @@ export class Session {
     const wantsLich = useLich ?? !!this.user.settings.get('lichPath')
     this.user.settings.patch({ connectWithLich: wantsLich } as never)
     const home = wantsLich ? provisionLichHome(this.server.dataDir, this.user.userId) : null
+    const frostbite = process.env['MAGILOOM_LICH_FROSTBITE'] === '1'
 
-    if (home) {
-      // (Lich is already stopped and its port released by the endSession above.)
-      if (process.env['MAGILOOM_LICH_FROSTBITE'] === '1') {
-        // Legacy single-instance path: Lich's frostbite `-g` listener is hardwired
-        // to 127.0.0.1:11024, so only ONE can run per container. Gate to that slot
-        // and connect any extra session directly. Kept as a fallback in case the
-        // headless path misbehaves against a given Lich build.
-        const port = this.server.ports.acquirePrimary()
-        if (port === null) {
-          this.lichLog('[sge] Another Lich session is already active on this server — connecting this character directly.')
-          this.emit('lich:status', 'stopped')
-          this.gameConn.connectDirect(key.host, key.port, key.key)
-          return { ok: true, lich: false, lichBusy: true }
-        }
-        this.lichPort = port
-        this.lichLog(`[sge] Launching Lich (frostbite mode, port ${this.lichPort}) for ${characterName}...`)
-        this.lichMgr.spawnOnly(key.host, key.port, home.lichRbw, this.lichPort, {
-          home: home.home, lib: home.lib, scripts: home.scripts,
-        })
-        this.lichLog(`[sge] Connecting to Lich on port ${this.lichPort}...`)
-        this.gameConn.connectWithKey('127.0.0.1', this.lichPort, key.key)
-      } else if (!this.loginPassword) {
-        // Headless Lich self-logs-in from entry.yaml, which needs the password we
-        // only hold during the login flow. Missing (e.g. a resumed session) → direct.
-        this.lichLog('[sge] No password available for headless Lich; connecting directly.')
+    // ── Headless/broker mode (default): Lich owns the login ─────────────────────
+    // Decided BEFORE any launch-key request, because in this mode we must not make
+    // one. Lich authenticates itself from entry.yaml — its own full SGE handshake,
+    // its own `L` request. A character has ONE live launch key, so also asking here
+    // (and discarding it, as we used to) puts two claims on the same character
+    // seconds apart and the game server refuses one of them with "Invalid login
+    // key. Please relogin to the web site." Hand the login to Lich and drop our SGE
+    // socket instead. Each session gets a unique detachable port, so any number of
+    // characters can run Lich at once.
+    if (home && !frostbite && this.loginPassword) {
+      this.pendingSelectClose?.()
+      this.pendingSelectClose = null
+      writeLichEntry(home.home, accountName, this.loginPassword, characterName)
+      this.loginPassword = null
+      this.lichPort = this.server.ports.acquire()
+      this.lichLog(`[sge] Launching Lich (headless mode, port ${this.lichPort}) for ${characterName}...`)
+      this.lichMgr.spawnHeadless(characterName, this.lichPort, home.lichRbw, {
+        home: home.home, lib: home.lib, scripts: home.scripts,
+      })
+      this.lichLog(`[sge] Attaching to Lich detachable client on port ${this.lichPort}...`)
+      this.gameConn.connect('127.0.0.1', this.lichPort)
+      return { ok: true }
+    }
+
+    // ── Every other path brokers the game connection itself, so it needs a key ──
+    let key: SGELaunchKey
+    try {
+      key = await fetchKey(characterId)
+    } catch (e) {
+      this.gameSessionActive = false
+      this.charName = ''
+      return { ok: false, error: String(e) }
+    }
+    this.pendingSelectClose = null   // the L request consumed the SGE socket
+
+    if (home && frostbite) {
+      // Legacy single-instance path: Lich's frostbite `-g` listener is hardwired
+      // to 127.0.0.1:11024, so only ONE can run per container. Gate to that slot
+      // and connect any extra session directly. Kept as a fallback in case the
+      // headless path misbehaves against a given Lich build.
+      const port = this.server.ports.acquirePrimary()
+      if (port === null) {
+        this.lichLog('[sge] Another Lich session is already active on this server — connecting this character directly.')
         this.emit('lich:status', 'stopped')
         this.gameConn.connectDirect(key.host, key.port, key.key)
-        return { ok: true, lich: false }
-      } else {
-        // Headless/broker mode (default): Lich authenticates itself and exposes a
-        // unique detachable port, so any number of characters run Lich at once.
-        writeLichEntry(home.home, accountName, this.loginPassword, characterName)
-        this.loginPassword = null
-        this.lichPort = this.server.ports.acquire()
-        this.lichLog(`[sge] Launching Lich (headless mode, port ${this.lichPort}) for ${characterName}...`)
-        this.lichMgr.spawnHeadless(characterName, this.lichPort, home.lichRbw, {
-          home: home.home, lib: home.lib, scripts: home.scripts,
-        })
-        this.lichLog(`[sge] Attaching to Lich detachable client on port ${this.lichPort}...`)
-        this.gameConn.connect('127.0.0.1', this.lichPort)
+        return { ok: true, lich: false, lichBusy: true }
       }
-    } else {
-      if (wantsLich) {
-        this.lichLog('[sge] Lich requested but no shared install found — connecting directly.')
-      }
-      this.lichLog('[sge] Connecting directly to ' + key.host + ':' + key.port)
-      this.gameConn.connectDirect(key.host, key.port, key.key)
+      this.lichPort = port
+      this.lichLog(`[sge] Launching Lich (frostbite mode, port ${this.lichPort}) for ${characterName}...`)
+      this.lichMgr.spawnOnly(key.host, key.port, home.lichRbw, this.lichPort, {
+        home: home.home, lib: home.lib, scripts: home.scripts,
+      })
+      this.lichLog(`[sge] Connecting to Lich on port ${this.lichPort}...`)
+      this.gameConn.connectWithKey('127.0.0.1', this.lichPort, key.key)
+      return { ok: true }
     }
+
+    if (home) {
+      // Headless Lich self-logs-in from entry.yaml, which needs the password we
+      // only hold during the login flow. Missing (e.g. a resumed session) → direct.
+      this.lichLog('[sge] No password available for headless Lich; connecting directly.')
+      this.emit('lich:status', 'stopped')
+      this.gameConn.connectDirect(key.host, key.port, key.key)
+      return { ok: true, lich: false }
+    }
+
+    if (wantsLich) {
+      this.lichLog('[sge] Lich requested but no shared install found — connecting directly.')
+    }
+    this.lichLog('[sge] Connecting directly to ' + key.host + ':' + key.port)
+    this.gameConn.connectDirect(key.host, key.port, key.key)
     return { ok: true }
   }
 
@@ -570,6 +610,7 @@ export class Session {
       // want exactly one 'game:disconnected' — and none at all for a session that
       // held nothing (endSession also runs at the START of a connect).
       const wasLive = this.isGameConnected() || this.lichPort !== null
+      this.gameSessionActive = false
       this.cmdEngine.stop()
       this.gameConn.disconnect()
       this.stopLich()
