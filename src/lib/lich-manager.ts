@@ -6,6 +6,11 @@ import { createConnection, Socket } from 'net'
 
 export type LichStatus = 'stopped' | 'starting' | 'ready' | 'error'
 
+// Spawn Lich into its own process group so we can signal the whole tree. Only on
+// platforms that have process groups AND where we launch through a wrapper — see
+// killTree(). Windows dev launches Ruby directly, so the plain child signal is right.
+const USE_PROCESS_GROUP = process.platform === 'linux'
+
 export class LichManager extends EventEmitter {
   private process:   ChildProcess | null = null
   private status:    LichStatus = 'stopped'
@@ -207,9 +212,33 @@ export class LichManager extends EventEmitter {
 
   stop(): void {
     this.clearPoll()
-    this.process?.kill('SIGTERM')
+    if (this.process) this.killTree(this.process)
     this.process = null
     this.setStatus('stopped')
+  }
+
+  /**
+   * Signal Lich AND anything it was launched under.
+   *
+   * On Linux we don't spawn Ruby directly — we spawn `xvfb-run`, a shell wrapper
+   * (see _spawn). Signalling the child therefore only kills the WRAPPER: Ruby is a
+   * grandchild, gets orphaned to init, and keeps running with its DR socket open.
+   * The character stays in the game world, so the next login DISPLACES it and the
+   * game server sends the old stream "Invalid login key. Please relogin to the web
+   * site." — which arrives on stdout we're still reading, because the orphan still
+   * holds the write end of that pipe.
+   *
+   * _spawn puts the wrapper and Lich in their own process group, so a negative pid
+   * signals the whole group and Lich actually dies. Falls back to a plain child
+   * signal on platforms without process groups (Windows dev).
+   */
+  private killTree(proc: ChildProcess, signal: NodeJS.Signals = 'SIGTERM'): void {
+    try {
+      if (USE_PROCESS_GROUP && proc.pid) process.kill(-proc.pid, signal)
+      else proc.kill(signal)
+    } catch {
+      try { proc.kill(signal) } catch { /* already gone */ }
+    }
   }
 
   /**
@@ -230,8 +259,11 @@ export class LichManager extends EventEmitter {
       let done = false
       const finish = () => { if (done) return; done = true; resolve() }
       proc.once('close', finish)
-      try { proc.kill('SIGTERM') } catch { finish() }
-      setTimeout(finish, timeoutMs)
+      this.killTree(proc)
+      // A Lich that ignores SIGTERM would otherwise be left running (and holding its
+      // DR login) once the timeout fires — escalate before giving up.
+      const hard = setTimeout(() => this.killTree(proc, 'SIGKILL'), Math.max(timeoutMs - 1000, 500))
+      setTimeout(() => { clearTimeout(hard); finish() }, timeoutMs)
     })
   }
 
@@ -246,7 +278,10 @@ export class LichManager extends EventEmitter {
     const [cmd, cmdArgs] = process.platform === 'linux'
       ? ['xvfb-run', ['-a', rubyPath, ...args]]
       : [rubyPath, args]
-    const proc = spawn(cmd, cmdArgs, { stdio: ['pipe', 'pipe', 'pipe'] })
+    // detached gives the wrapper + Lich their own process group so killTree() can
+    // signal BOTH (see killTree). Not unref'd — we still own the process and its
+    // stdio, and stop()/stopAndWait() are what end it.
+    const proc = spawn(cmd, cmdArgs, { stdio: ['pipe', 'pipe', 'pipe'], detached: USE_PROCESS_GROUP })
     this.process = proc
     proc.stdin?.end()
 
