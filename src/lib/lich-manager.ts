@@ -212,6 +212,29 @@ export class LichManager extends EventEmitter {
     this.setStatus('stopped')
   }
 
+  /**
+   * Stop Lich and resolve once it has FULLY exited (its 'close' event, after stdio
+   * drains). The caller returns its detachable-client port to the shared pool, and
+   * the allocator hands back the lowest free port — so releasing before the Ruby
+   * process is gone would give the next session a port the dying one still binds,
+   * and that Lich dies on startup. Resolves immediately when nothing is running,
+   * and after `timeoutMs` if the process refuses to die so a reconnect never hangs.
+   */
+  stopAndWait(timeoutMs = 4000): Promise<void> {
+    this.clearPoll()
+    const proc = this.process
+    this.process = null
+    this.setStatus('stopped')
+    if (!proc || proc.exitCode !== null || proc.signalCode !== null) return Promise.resolve()
+    return new Promise<void>((resolve) => {
+      let done = false
+      const finish = () => { if (done) return; done = true; resolve() }
+      proc.once('close', finish)
+      try { proc.kill('SIGTERM') } catch { finish() }
+      setTimeout(finish, timeoutMs)
+    })
+  }
+
   getStatus(): LichStatus { return this.status }
 
   private _spawn(rubyPath: string, args: string[]): void {
@@ -223,8 +246,9 @@ export class LichManager extends EventEmitter {
     const [cmd, cmdArgs] = process.platform === 'linux'
       ? ['xvfb-run', ['-a', rubyPath, ...args]]
       : [rubyPath, args]
-    this.process = spawn(cmd, cmdArgs, { stdio: ['pipe', 'pipe', 'pipe'] })
-    this.process.stdin?.end()
+    const proc = spawn(cmd, cmdArgs, { stdio: ['pipe', 'pipe', 'pipe'] })
+    this.process = proc
+    proc.stdin?.end()
 
     // Lich's own logging (Lich.log) goes to STDERR, so this is where the "why did
     // it quit" detail lives. Keep a tail so we can replay it on exit — a fast/quiet
@@ -232,15 +256,20 @@ export class LichManager extends EventEmitter {
     // be lost.
     const tail: string[] = []
     const record = (l: string) => { tail.push(l); if (tail.length > 80) tail.shift() }
+    // True only while `proc` is the manager's current process. Once it's replaced by a
+    // new spawn or intentionally stopped (this.process !== proc), its late stdio/close
+    // events must NOT touch status or emit errors — otherwise every ordinary disconnect
+    // surfaces as a spurious "Lich terminated by signal SIGTERM" failure.
+    const current = () => this.process === proc
 
-    this.process.stdout?.on('data', (d: Buffer) => {
+    proc.stdout?.on('data', (d: Buffer) => {
       d.toString().split('\n').filter(Boolean).forEach(l => { record(l); this.emit('log', l) })
     })
-    this.process.stderr?.on('data', (d: Buffer) => {
+    proc.stderr?.on('data', (d: Buffer) => {
       d.toString().split('\n').filter(Boolean).forEach(l => {
         record(`[stderr] ${l}`)
         this.emit('log', `[stderr] ${l}`)
-        if (/error|failed|invalid|no such|cannot/i.test(l) && this.status !== 'ready') {
+        if (/error|failed|invalid|no such|cannot/i.test(l) && this.status !== 'ready' && current()) {
           this.setStatus('error')
           this.emit('error', l.trim())
         }
@@ -250,8 +279,10 @@ export class LichManager extends EventEmitter {
     // Record the exit code, but do the diagnostic on 'close' — it fires only after
     // stdout/stderr have fully drained, so we never miss Lich's final words.
     let exited: { code: number | null; signal: NodeJS.Signals | null } | null = null
-    this.process.on('exit', (code, signal) => { exited = { code, signal }; this.clearPoll() })
-    this.process.on('close', () => {
+    proc.on('exit', (code, signal) => { exited = { code, signal }; if (current()) this.clearPoll() })
+    proc.on('close', () => {
+      // A stale process we've already replaced/stopped: stay silent.
+      if (!current()) return
       if (this.status === 'ready') { this.setStatus('stopped'); this.process = null; return }
       const code = exited?.code ?? null
       const signal = exited?.signal ?? null

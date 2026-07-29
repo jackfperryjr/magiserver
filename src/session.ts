@@ -136,7 +136,11 @@ export class Session {
 
     this.gameConn.on('log',          (l: string) => this.lichLog('[game] ' + l))
     this.gameConn.on('connected',    () => { this.lichLog('[game] Connected'); this.emit('game:connected'); this.syncPresence() })
-    this.gameConn.on('disconnected', () => { this.lichLog('[game] Disconnected'); this.emit('game:disconnected'); this.syncPresence() })
+    // Any drop — link death, a /quit in game, Lich exiting under us — ends the whole
+    // session, not just the socket, so Lich and its pooled port are released for the
+    // next connect. endSession() emits 'game:disconnected' and syncs presence, and is
+    // a no-op when this drop CAME from it.
+    this.gameConn.on('disconnected', () => { this.lichLog('[game] Disconnected'); this.endSession() })
     this.gameConn.on('error',        (e: string) => { this.lichLog('[game] Error: ' + e); this.emit('game:error', e) })
     this.gameConn.on('data',         (r: string) => {
       this.recentOutput.push(r)
@@ -349,7 +353,7 @@ export class Session {
       // reload can't be told which of several characters this conn is running, and
       // account-shared settings drift across devices). Empty until the name is known.
       case 'game:get-char':   return this.charName
-      case 'game:disconnect': return this.gameConn.disconnect()
+      case 'game:disconnect': return this.endSession()
       case 'game:send': {
         this.gameConn.send(a[0] as string)
         this.emit('game:sent', a[0] as string)
@@ -441,6 +445,10 @@ export class Session {
       return { ok: false, error: String(e) }
     }
     this.pendingSelectCharacter = null
+    // Fully end the PREVIOUS session first — this path also runs for an in-app
+    // character switch, where the old socket and old Lich are still live. Frees the
+    // old Lich's pooled port before we acquire a new one below.
+    this.endSession()
     this.user.settings.saveAccount(accountName, characterName)
     this.lichReadyDetected = false
     this.charName = characterName
@@ -457,7 +465,7 @@ export class Session {
     const home = wantsLich ? provisionLichHome(this.server.dataDir, this.user.userId) : null
 
     if (home) {
-      this.stopLich()
+      // (Lich is already stopped and its port released by the endSession above.)
       if (process.env['MAGILOOM_LICH_FROSTBITE'] === '1') {
         // Legacy single-instance path: Lich's frostbite `-g` listener is hardwired
         // to 127.0.0.1:11024, so only ONE can run per container. Gate to that slot
@@ -520,19 +528,64 @@ export class Session {
     return !!self && (name ?? '').trim().toLowerCase() === self
   }
 
-  /** Stop Lich and return its port to the pool. */
+  /**
+   * Stop Lich and return its port to the pool — but only ONCE THE PROCESS IS GONE.
+   * PortAllocator.acquire() hands back the lowest free port, so releasing while the
+   * Ruby process is still dying gives the next session a port the old Lich still
+   * binds, and that Lich dies on startup. Detaching the port from the session up
+   * front means a reconnect just takes the next free one instead of waiting.
+   */
   private stopLich(): void {
-    this.lichMgr.stop()
+    const port = this.lichPort
+    this.lichPort = null
     this.lichConn.disconnect()
-    if (this.lichPort !== null) { this.server.ports.release(this.lichPort); this.lichPort = null }
+    void this.lichMgr.stopAndWait().then(() => {
+      if (port !== null) this.server.ports.release(port)
+    })
   }
 
-  /** Tear down per-session resources (mirrors window-all-closed for one window). */
+  /**
+   * End the game session and release everything it holds: running scripts, the game
+   * socket, Lich, Lich's POOLED PORT, and this character's messaging presence.
+   *
+   * Dropping only the socket is not a disconnect — headless Lich is the process that
+   * authenticated to DR and owns the detachable-client port, so leaving it up keeps
+   * the character logged in and permanently burns a port out of the allocator pool.
+   * Every way a session can end comes through here: an explicit `game:disconnect`,
+   * any unsolicited drop from DR, the start of a new connect, and gateway dispose().
+   *
+   * The Session SHELL survives (its WebSocket clients stay attached and can log in
+   * again); it just holds no resources. With the game socket down, the gateway's
+   * keepalive no longer applies, so an abandoned shell falls to the short grace.
+   *
+   * Re-entrant-safe: gameConn.disconnect() re-emits 'disconnected', whose handler
+   * calls straight back into this.
+   */
+  private ending = false
+  private endSession(): void {
+    if (this.ending) return
+    this.ending = true
+    try {
+      // Captured up front: gameConn.disconnect() below reports its own drop, and we
+      // want exactly one 'game:disconnected' — and none at all for a session that
+      // held nothing (endSession also runs at the START of a connect).
+      const wasLive = this.isGameConnected() || this.lichPort !== null
+      this.cmdEngine.stop()
+      this.gameConn.disconnect()
+      this.stopLich()
+      this.lichReadyDetected = false
+      this.charName = ''
+      this.syncPresence()   // game socket down → deregister from the messaging hub
+      if (wasLive) this.emit('game:disconnected')
+    } finally {
+      this.ending = false
+    }
+  }
+
+  /** Tear down per-session resources (mirrors window-all-closed for one window).
+   *  Called by the gateway once the last client is gone and grace/keepalive expires. */
   dispose(): void {
-    if (this.registeredName) { this.server.hub.deregister(this.registeredName, this); this.registeredName = '' }
     this.loginPassword = null
-    this.cmdEngine.stop()
-    this.gameConn.disconnect()
-    this.stopLich()
+    this.endSession()
   }
 }

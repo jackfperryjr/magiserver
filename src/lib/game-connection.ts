@@ -5,37 +5,46 @@ export class GameConnection extends EventEmitter {
   private socket: Socket | null = null
   private buffer = ''
   private idleTimer: ReturnType<typeof setTimeout> | null = null
+  // Bumped by every connect attempt and by disconnect(). A socket (or a pending
+  // retry) only counts while its generation is still current — anything older
+  // belongs to a connection we've already replaced or dropped. Callers now tear
+  // down Lich when 'disconnected' fires, so a stale close event must never be
+  // reported: it would kill the connection that just replaced it.
+  private gen = 0
 
   connectDirect(host: string, port: number, key: string): void {
-    if (this.socket) this.disconnect()
-    this.socket = new Socket()
-    this.socket.setEncoding('latin1')
-    this.socket.on('connect', () => {
+    this.disconnect()
+    const gen = ++this.gen
+    const s = new Socket()
+    this.socket = s
+    s.setEncoding('latin1')
+    s.on('connect', () => {
       // Full StormFront game-server login. Talking straight to the game (no Lich),
       // the server needs the complete FE identification + two blank lines, exactly
       // as Wrayth/Lich send — the bare "/FE:STORMFRONT" is only enough for Lich,
       // which re-does this handshake itself. Sending the short form to the game
       // server makes it accept the socket then drop it.
-      this.socket!.write(key + '\n', 'latin1')
-      this.socket!.write('/FE:STORMFRONT /VERSION:1.0.1.26 /P:WIN_XP /XML\n', 'latin1')
-      this.socket!.write('\n', 'latin1')
-      this.socket!.write('\n', 'latin1')
+      s.write(key + '\n', 'latin1')
+      s.write('/FE:STORMFRONT /VERSION:1.0.1.26 /P:WIN_XP /XML\n', 'latin1')
+      s.write('\n', 'latin1')
+      s.write('\n', 'latin1')
       this.emit('connected')
     })
-    this.socket.on('data',  (c: string) => { this.buffer += c; this.flush() })
-    this.socket.on('close', ()          => { this.emit('disconnected'); this.socket = null })
-    this.socket.on('error', (e)         => this.emit('error', e.message))
-    this.socket.connect(port, host)
+    s.on('data',  (c: string) => { this.buffer += c; this.flush() })
+    s.on('close', ()          => { if (this.socket === s) this.socket = null; if (gen === this.gen) this.emit('disconnected') })
+    s.on('error', (e)         => this.emit('error', e.message))
+    s.connect(port, host)
   }
 
   connectWithKey(host: string, port: number, key: string): void {
-    if (this.socket) this.disconnect()
+    this.disconnect()
+    const gen = ++this.gen
     this.emit('log', 'Attempting to connect to ' + host + ':' + port + '...')
-    this._tryConnectWithKey(host, port, key, 0)
+    this._tryConnectWithKey(host, port, key, gen, 0)
   }
 
-  private _tryConnectWithKey(host: string, port: number, key: string, attempts: number): void {
-    if (this.socket) return
+  private _tryConnectWithKey(host: string, port: number, key: string, gen: number, attempts: number): void {
+    if (this.socket || gen !== this.gen) return
     const s = new Socket()
     s.setEncoding('latin1')
     let connected = false
@@ -48,14 +57,14 @@ export class GameConnection extends EventEmitter {
       this.emit('connected')
     })
     s.on('data',  (c: string) => { this.buffer += c; this.flush() })
-    // Emit 'disconnected' only for a socket that actually connected — not a failed
-    // retry, and even after disconnect() has already nulled this.socket.
-    s.on('close', ()          => { if (connected) this.emit('disconnected'); if (this.socket === s) this.socket = null })
+    // Emit 'disconnected' only for a socket that actually connected (not a failed
+    // retry) and is still the current generation — disconnect() reports its own.
+    s.on('close', ()          => { if (this.socket === s) this.socket = null; if (connected && gen === this.gen) this.emit('disconnected') })
     s.on('error', (err) => {
       s.destroy()
       if (err.message.includes('ECONNREFUSED') && attempts < 240) {
-        setTimeout(() => this._tryConnectWithKey(host, port, key, attempts + 1), 500)
-      } else {
+        setTimeout(() => this._tryConnectWithKey(host, port, key, gen, attempts + 1), 500)
+      } else if (gen === this.gen) {
         this.emit('error', err.message)
       }
     })
@@ -63,13 +72,14 @@ export class GameConnection extends EventEmitter {
   }
 
   connect(host: string, port: number): void {
-    if (this.socket) this.disconnect()
+    this.disconnect()
+    const gen = ++this.gen
     this.emit('log', 'Attempting to connect to ' + host + ':' + port + '...')
-    this._tryConnect(host, port, 0)
+    this._tryConnect(host, port, gen, 0)
   }
 
-  private _tryConnect(host: string, port: number, attempts: number): void {
-    if (this.socket) return
+  private _tryConnect(host: string, port: number, gen: number, attempts: number): void {
+    if (this.socket || gen !== this.gen) return
     const s = new Socket()
     s.setEncoding('latin1')
     let connected = false
@@ -80,12 +90,12 @@ export class GameConnection extends EventEmitter {
       this.emit('connected')
     })
     s.on('data',  (c: string) => { this.buffer += c; this.flush() })
-    s.on('close', ()          => { if (connected) this.emit('disconnected'); if (this.socket === s) this.socket = null })
+    s.on('close', ()          => { if (this.socket === s) this.socket = null; if (connected && gen === this.gen) this.emit('disconnected') })
     s.on('error', (err) => {
       s.destroy()
       if (err.message.includes('ECONNREFUSED') && attempts < 240) {
-        setTimeout(() => this._tryConnect(host, port, attempts + 1), 500)
-      } else {
+        setTimeout(() => this._tryConnect(host, port, gen, attempts + 1), 500)
+      } else if (gen === this.gen) {
         this.emit('error', err.message)
       }
     })
@@ -96,11 +106,20 @@ export class GameConnection extends EventEmitter {
     return (this.socket && !this.socket.destroyed) ? 'connected' : 'disconnected'
   }
 
+  /**
+   * Drop the connection and abandon any in-flight retry loop. Reports
+   * 'disconnected' SYNCHRONOUSLY when a live socket was dropped, rather than
+   * leaving it to the socket's async 'close' — callers tear down Lich on that
+   * event, so it has to land before the caller starts a replacement connection.
+   */
   disconnect(): void {
+    const wasLive = !!this.socket && !this.socket.destroyed
+    this.gen++
     this.socket?.destroy()
     this.socket = null
     this.buffer = ''
     if (this.idleTimer) { clearTimeout(this.idleTimer); this.idleTimer = null }
+    if (wasLive) this.emit('disconnected')
   }
 
   send(data: string): void {
