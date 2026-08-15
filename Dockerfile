@@ -30,15 +30,27 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # system load path where lich.rbw's plain `require`s find them.
 #
 # The gtk group IS installed (only dev/vscode/profanity are skipped): current Lich 5
-# (5.19) both requires the gtk3 gem AND calls Gtk.init at startup unconditionally —
-# there is no headless/without-frontend bypass — so it needs a real X display too.
+# both requires the gtk3 gem AND calls Gtk.init at startup unconditionally — there is
+# no headless/without-frontend bypass — so it needs a real X display too.
 # The GTK dev headers above let the gem build; the xvfb/xauth packages above provide
 # the throwaway virtual display Gtk.init needs (Lich is launched under xvfb-run — see
 # lib/lich-manager.ts). Without it Lich aborts with "failed to initialize GTK+".
 #
+# PINNED to a tag, not master. This pin IS the Lich update mechanism for this server:
+# `;lich5-update --update` cannot work here, because the engine is shared at /opt/lich
+# while each session runs with a per-user --home, so the updater's snapshot looks for
+# <home>/lich.rbw (missing) and its writes would land half in the shared engine and half
+# in a path nothing executes. Bump this tag and redeploy instead — that moves lich.rbw
+# and lib/ together, which is the only combination Lich is tested in.
+#
+# 5.20.0 NOTE: PR #1491 stopped enforcing ShowRoomID and made room-id placement opt-in,
+# defaulting DR to `line`. Magiloom's automapper scrapes the id off the room TITLE
+# (mapModel.ts parseRoomUid), so sessions need `;display roomid title` (or `both`) or
+# room identity silently degrades to heuristic matching.
+#
 # NOTE: baking Lich here is still experimental. A failed build does NOT take down your
 # running deploy (Railway keeps the last good one until a new build succeeds).
-RUN git clone --depth 1 https://github.com/elanthia-online/lich-5.git /opt/lich \
+RUN git clone --depth 1 --branch v5.20.0 https://github.com/elanthia-online/lich-5.git /opt/lich \
     && cd /opt/lich \
     && bundle lock --add-platform x86_64-linux \
     && bundle config set --local without 'development vscode profanity' \
