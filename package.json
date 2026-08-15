@@ -8,6 +8,7 @@
     "build": "tsc -p tsconfig.json",
     "start": "node dist/index.js",
     "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "tsx test-messaging.ts",
     "vapid": "web-push generate-vapid-keys"
   },
   "dependencies": {
