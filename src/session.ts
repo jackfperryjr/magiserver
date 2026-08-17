@@ -412,15 +412,20 @@ export class Session {
       // and writes the same zones — so writes are gated to a connected DR character:
       // a drive-by account (email sign-up, no game login) can't corrupt the community
       // map, but real players exploring still contribute normally. Reads stay open
-      // (it's just world geography). Wiping the whole shared DB is never a remote
-      // action — it's operator-only (filesystem), so map:clear is a no-op here.
+      // (it's just world geography).
+      //
+      // DESTRUCTIVE operations are operator-only (filesystem), because nothing here
+      // records who contributed what: a zone file is the accumulated work of everyone
+      // who has walked that area, so there is no such thing as deleting "your own"
+      // zone. One client clearing a zone would erase geography for every other
+      // player, which is what map:delete-zone used to do. Both it and map:clear are
+      // refused remotely; a zone can still be corrected room-by-room via save-zone.
       case 'map:load':        return this.server.map.loadAll()
       case 'map:save-zone':
         if (!this.charName) throw new Error('Connect a character before editing the map.')
         return this.server.map.saveZone(a[0] as StoredZone)
       case 'map:delete-zone':
-        if (!this.charName) throw new Error('Connect a character before editing the map.')
-        return this.server.map.deleteZone(a[0] as string)
+        throw new Error('The shared map is community-built; clearing a zone is operator-only.')
       case 'map:clear':       return   // disabled remotely — shared DB, operator-only
       case 'map:export':      return { ok: false, error: 'Export happens client-side on the web build.' }
 
