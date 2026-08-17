@@ -65,6 +65,12 @@ export class Session {
   // client can repopulate the room panel instead of showing exits/objs with no name.
   private stickyRoomName: string | null = null
   private stickyRoomDesc: string | null = null
+  // …and the <nav rm='NNNN'/> that identifies it. Without this an attaching client
+  // gets a room with a name and a description but no id, so its automapper has to
+  // fall back to content matching for the room it is standing in — which is exactly
+  // where two identical wilderness rooms become indistinguishable. Sent first,
+  // matching the live order (<nav> leads the room feed on arrival).
+  private stickyRoomNav: string | null = null
 
   // Per-session SGE login continuation (each user logs in independently).
   private pendingSelectInstance:  ((code: string) => Promise<unknown>) | null = null
@@ -153,6 +159,9 @@ export class Session {
       // component); description is the room-desc component.
       if (/subtitle=['"] - /.test(r) || /id=['"]room name['"]/.test(r)) this.stickyRoomName = r
       if (/id=['"]room desc['"]/.test(r)) this.stickyRoomDesc = r
+      // Only a nav that actually carries an id: a bare <nav/> means "this room has
+      // no id", which is live information, not something to replay later.
+      if (/<nav\b[^>]*\brm=['"]?\d+/.test(r)) this.stickyRoomNav = r
       this.emit('game:data', r)
       this.cmdEngine.feed(r)
       this.triggers.feed(r)   // server-side alert eval → push
@@ -193,7 +202,7 @@ export class Session {
     // by the frequently-refreshed recentOutput. De-duped in case one chunk held both.
     // Sent before the scrollback so any newer objs/exits in it still layer on top.
     const seen = new Set<string>()
-    for (const chunk of [this.stickyRoomName, this.stickyRoomDesc]) {
+    for (const chunk of [this.stickyRoomNav, this.stickyRoomName, this.stickyRoomDesc]) {
       if (chunk && !seen.has(chunk)) { seen.add(chunk); emit('game:data', chunk) }
     }
     if (replayOutput) for (const r of this.recentOutput) emit('game:data', r)
