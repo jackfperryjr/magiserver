@@ -1,0 +1,115 @@
+name: Lich update check
+
+# Watches elanthia-online/lich-5 for new releases and opens a PR bumping the tag
+# pinned in the Dockerfile.
+#
+# The pin IS this server's Lich update mechanism (see the comment block above the
+# git clone in Dockerfile) — `;lich5-update` can't work against a shared engine +
+# per-user --home. So the only way to move Lich is to change that tag and redeploy,
+# and the only thing worth automating is noticing that a new tag exists.
+#
+# This job never merges anything. It opens a PR labelled `lich-update`; the
+# merge-window workflow picks it up only after you approve it.
+on:
+  schedule:
+    # Mondays 06:00 UTC. Lich releases land every few weeks, so weekly is plenty.
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write        # labels live on the issues API
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Compare the pinned tag against the latest Lich release
+        id: lich
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          # Exactly one line in the Dockerfile carries a --branch tag.
+          current=$(sed -n 's|.*--branch \(v[0-9][0-9.]*\)[[:space:]].*|\1|p' Dockerfile)
+          latest=$(gh release view --repo elanthia-online/lich-5 --json tagName -q .tagName)
+
+          echo "pinned=$current  latest=$latest"
+          echo "current=$current" >> "$GITHUB_OUTPUT"
+          echo "latest=$latest"   >> "$GITHUB_OUTPUT"
+
+          if [ "$current" = "$latest" ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+
+          # Only the tag token moves. The prose around it (why the pin exists, the
+          # roomid caveat) is hand-written and stays put.
+          sed -i "s|--branch $current |--branch $latest |" Dockerfile
+
+          # Release notes for the PR body, minus the formatter sentinel comments
+          # upstream embeds at the top.
+          gh release view "$latest" --repo elanthia-online/lich-5 --json body -q .body \
+            | grep -v '^<!--' > /tmp/notes.md
+
+          {
+            echo "Bumps the pinned Lich engine from \`$current\` to \`$latest\`."
+            echo
+            echo "Automated by \`.github/workflows/lich-update-check.yml\`. This is a"
+            echo "one-token change to the \`git clone --branch\` in the Dockerfile — the"
+            echo "surrounding notes are hand-maintained and untouched."
+            echo
+            echo "**Read the notes before approving.** Anything touching DR stream"
+            echo "output, room-id placement, or EAccess/SGE login can move behaviour"
+            echo "the gateway depends on, and none of that is covered by CI (the"
+            echo "Checks workflow does not build the image)."
+            echo
+            echo "---"
+            echo
+            cat /tmp/notes.md
+            echo
+            echo "---"
+            echo
+            echo "Full notes: https://github.com/elanthia-online/lich-5/releases/tag/$latest"
+            echo
+            echo "Approve to hand this to the nightly merge window, or merge it yourself."
+          } > /tmp/pr-body.md
+
+      # Idempotent — the label has to exist before a PR can carry it, and the
+      # merge-window workflow keys off it.
+      - name: Ensure the lich-update label exists
+        if: steps.lich.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh label create lich-update \
+            --color 1f6feb \
+            --description "Lich engine bump; eligible for the nightly merge window" \
+            --force
+
+      # Reuses one branch, so a release landing while an earlier bump is still open
+      # updates that PR instead of stacking a second one.
+      #
+      # NOTE: a PR opened with the default GITHUB_TOKEN does not trigger `pull_request`
+      # workflows, so Checks will not run here on its own. That is tolerable for a
+      # Dockerfile-tag change (Checks typechecks/tests/builds the gateway, none of
+      # which this touches) but it does mean the merge window has no green tick to
+      # gate on. Set a LICH_PR_TOKEN secret (a PAT with repo scope) to get CI back.
+      - name: Open the bump PR
+        if: steps.lich.outputs.changed == 'true'
+        uses: peter-evans/create-pull-request@v8
+        with:
+          token: ${{ secrets.LICH_PR_TOKEN || github.token }}
+          commit-message: "Bump Lich to ${{ steps.lich.outputs.latest }}"
+          title: "Bump Lich ${{ steps.lich.outputs.current }} → ${{ steps.lich.outputs.latest }}"
+          body-path: /tmp/pr-body.md
+          branch: chore/lich-update
+          delete-branch: true
+          labels: lich-update
+          add-paths: Dockerfile

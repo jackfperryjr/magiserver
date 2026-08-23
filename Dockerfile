@@ -1,20 +1,12 @@
-# Magiloom server image: Ruby (Lich) + Node (gateway).
+# Magiloom server image: Ruby (Lich) + Node (gateway). Lich is cloned at build time.
 #
-# The Ruby base carries Lich; Node.js is layered on for the gateway. Lich itself
-# is CLONED from GitHub at build time (below) — nothing to upload by hand.
-#
-# Ruby 4.0+ is required by current Lich 5 (older Ruby aborts at startup with
-# "Your version … of Ruby is too old"). Ruby 4.x images are published on Debian
-# trixie (13), not bookworm (12) — there is no 4.x-slim-bookworm — so this is also
-# a base-OS bump; the apt package names below are unchanged on trixie.
+# Ruby 4.0+ is required by Lich 5, and Ruby 4.x images ship on trixie, not bookworm —
+# so this pins the base OS too. apt package names are unchanged on trixie.
 FROM ruby:4.0-slim-trixie
 
-# Node.js 20 + the C toolchain Lich's native gems (sqlite3, ffi) need to build.
-# The libgtk-3-dev + libgirepository1.0-dev stack is for Lich's gtk3 gem: current
-# Lich 5 checks for gtk3 at startup UNCONDITIONALLY (even --without-frontend, which
-# only stops it opening a window, doesn't skip the gem preflight), so the gem must
-# be installable — which needs the GTK/GObject-introspection dev headers. libgtk-3-dev
-# pulls the glib/cairo/pango/gdk-pixbuf -dev deps the ruby-gnome chain builds against.
+# Node 20 + the C toolchain Lich's native gems (sqlite3, ffi) build against.
+# The GTK/gobject-introspection headers are for Lich's gtk3 gem: Lich 5 preflights
+# gtk3 unconditionally, even under --without-frontend.
 RUN apt-get update && apt-get install -y --no-install-recommends \
       curl ca-certificates git build-essential libsqlite3-dev libffi-dev \
       libssl-dev zlib1g-dev pkg-config libgtk-3-dev libgirepository1.0-dev \
@@ -24,33 +16,27 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # --- Shared Lich engine --------------------------------------------------------
-# Read-only base cloned into /opt/lich; each user gets an isolated home seeded
-# from it (src/lich-home.ts). MAGILOOM_LICH_SHARED points the server at it, which
-# lights up the "Connect with Lich" toggle. `bundle install` puts the gems on the
-# system load path where lich.rbw's plain `require`s find them.
+# Read-only base at /opt/lich; each user gets an isolated home seeded from it
+# (src/lich-home.ts). MAGILOOM_LICH_SHARED lights up the "Connect with Lich" toggle.
 #
-# The gtk group IS installed (only dev/vscode/profanity are skipped): current Lich 5
-# both requires the gtk3 gem AND calls Gtk.init at startup unconditionally — there is
-# no headless/without-frontend bypass — so it needs a real X display too.
-# The GTK dev headers above let the gem build; the xvfb/xauth packages above provide
-# the throwaway virtual display Gtk.init needs (Lich is launched under xvfb-run — see
-# lib/lich-manager.ts). Without it Lich aborts with "failed to initialize GTK+".
+# The gtk group is installed (only dev/vscode/profanity are skipped) because Lich
+# also calls Gtk.init at startup with no headless bypass — hence xvfb above, which
+# lich-manager.ts wraps the launch in. Without it: "failed to initialize GTK+".
 #
-# PINNED to a tag, not master. This pin IS the Lich update mechanism for this server:
-# `;lich5-update --update` cannot work here, because the engine is shared at /opt/lich
-# while each session runs with a per-user --home, so the updater's snapshot looks for
-# <home>/lich.rbw (missing) and its writes would land half in the shared engine and half
-# in a path nothing executes. Bump this tag and redeploy instead — that moves lich.rbw
-# and lib/ together, which is the only combination Lich is tested in.
+# PINNED to a tag, and the pin IS the update mechanism here: `;lich5-update` can't
+# work against a shared engine + per-user --home (its snapshot looks for
+# <home>/lich.rbw, and its writes would split across two paths). Bump and redeploy
+# instead — that moves lich.rbw and lib/ together. The tag is watched by
+# .github/workflows/lich-update-check.yml, which opens a PR on a new release; only
+# the tag token is machine-edited.
 #
-# 5.20.0 NOTE: PR #1491 stopped enforcing ShowRoomID and made room-id placement opt-in,
-# defaulting DR to `line`. Magiloom's automapper scrapes the id off the room TITLE
-# (mapModel.ts parseRoomUid), so sessions need `;display roomid title` (or `both`) or
-# room identity silently degrades to heuristic matching.
+# 5.20.x: PR #1491 made room-id placement opt-in, defaulting DR to `line`. The
+# automapper scrapes the id off the room TITLE (mapModel.ts parseRoomUid), so
+# sessions need `;display roomid title` or room identity degrades to heuristics.
 #
-# NOTE: baking Lich here is still experimental. A failed build does NOT take down your
-# running deploy (Railway keeps the last good one until a new build succeeds).
-RUN git clone --depth 1 --branch v5.20.0 https://github.com/elanthia-online/lich-5.git /opt/lich \
+# A failed build does not take down the running deploy — Railway keeps the last good
+# one until a new build succeeds.
+RUN git clone --depth 1 --branch v5.20.1 https://github.com/elanthia-online/lich-5.git /opt/lich \
     && cd /opt/lich \
     && bundle lock --add-platform x86_64-linux \
     && bundle config set --local without 'development vscode profanity' \
@@ -63,15 +49,13 @@ ENV MAGILOOM_LICH_SHARED=/opt/lich
 
 WORKDIR /app
 COPY package*.json ./
-# Install all deps (incl. dev) so tsc is available for the build.
+# Dev deps included so tsc is available for the build; pruned after.
 RUN npm ci || npm install
 COPY . .
-# Compile TypeScript, then drop dev deps to slim the runtime image.
 RUN npm run build && npm prune --omit=dev
 
 ENV MAGILOOM_DATA_DIR=/data
-# Persist /data by attaching a Railway Volume with mount path /data in the
-# service's settings. Railway ignores the Dockerfile VOLUME instruction, so it's
-# intentionally omitted; without an attached volume /data is ephemeral.
+# Persist /data by attaching a Railway Volume mounted at /data. Railway ignores the
+# Dockerfile VOLUME instruction, so it's omitted; without a volume /data is ephemeral.
 EXPOSE 8787
 CMD ["npm", "start"]
