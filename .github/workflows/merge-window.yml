@@ -1,0 +1,94 @@
+name: Merge window
+
+# Squash-merges approved Lich bumps overnight, so the Railway rebuild + restart
+# lands when nobody is connected.
+#
+# This does NOT loosen the rule that magiserver changes are merged deliberately:
+# a PR is only touched here if YOU have already approved it. The workflow chooses
+# the hour, not the outcome. Anything unapproved sits until you look at it.
+#
+# Scope is the `lich-update` label alone. Label any other PR with it to send it
+# through the same window.
+on:
+  schedule:
+    # 07:07 UTC daily — ~03:07 ET in summer, ~02:07 in winter (Actions cron is
+    # UTC-only, so the local hour drifts with DST). The odd minute is deliberate:
+    # runs on the hour queue behind everyone else's. Scheduled runs can be delayed
+    # or skipped entirely under load, so treat this as "some time tonight", not a
+    # deadline — an unmerged PR just waits for tomorrow's run.
+    - cron: "7 7 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  merge:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Merge approved lich-update PRs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          prs=$(gh pr list --state open --label lich-update \
+                  --json number,title,isDraft,mergeable,reviewDecision,statusCheckRollup)
+
+          count=$(echo "$prs" | jq 'length')
+          if [ "$count" = "0" ]; then
+            echo "No open lich-update PRs."
+            exit 0
+          fi
+
+          echo "$prs" | jq -c '.[]' | while read -r pr; do
+            num=$(echo "$pr" | jq -r '.number')
+            title=$(echo "$pr" | jq -r '.title')
+            echo "── #$num $title"
+
+            if [ "$(echo "$pr" | jq -r '.isDraft')" = "true" ]; then
+              echo "   skip: draft"; continue
+            fi
+
+            # The gate. GitHub reports APPROVED only when the latest review from a
+            # reviewer with write access is an approval and no change request is
+            # outstanding, which is exactly the condition we want.
+            decision=$(echo "$pr" | jq -r '.reviewDecision // "NONE"')
+            if [ "$decision" != "APPROVED" ]; then
+              echo "   skip: not approved (reviewDecision=$decision)"; continue
+            fi
+
+            mergeable=$(echo "$pr" | jq -r '.mergeable')
+            if [ "$mergeable" != "MERGEABLE" ]; then
+              echo "   skip: not mergeable ($mergeable)"; continue
+            fi
+
+            # Check runs expose status/conclusion; commit statuses expose state.
+            # Anything still running blocks; anything not green blocks.
+            pending=$(echo "$pr" | jq '[.statusCheckRollup[]?
+              | select(.__typename == "CheckRun" and .status != "COMPLETED")] | length')
+            if [ "$pending" != "0" ]; then
+              echo "   skip: $pending check(s) still running"; continue
+            fi
+
+            failing=$(echo "$pr" | jq -r '[.statusCheckRollup[]?
+              | (.conclusion // .state // "")
+              | select(. != "SUCCESS" and . != "NEUTRAL" and . != "SKIPPED")] | length')
+            if [ "$failing" != "0" ]; then
+              echo "   skip: $failing check(s) not green"; continue
+            fi
+
+            # Bot-opened PRs carry no checks at all (the default GITHUB_TOKEN does
+            # not trigger `pull_request` workflows). Loud, not fatal — your approval
+            # is the real gate here, and Checks does not build the image anyway.
+            total=$(echo "$pr" | jq '[.statusCheckRollup[]?] | length')
+            if [ "$total" = "0" ]; then
+              echo "   note: no checks reported on this PR — merging on approval alone"
+            fi
+
+            echo "   merging"
+            gh pr merge "$num" --squash --delete-branch
+          done
