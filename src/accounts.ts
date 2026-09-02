@@ -25,11 +25,20 @@ export interface Account {
   passwordHash: string   // "saltHex:hashHex" (scrypt)
   tier:         AccountTier
   createdAt:    number
+  // Plan-change history, kept so a DOWNGRADE can be honoured gently: for a grace
+  // window the previous plan's storage limits still apply, rather than the next
+  // prune deleting eleven days of logs the moment a subscription lapses. See
+  // lib/tiers.ts. Absent on accounts whose plan has never changed.
+  prevTier?:      AccountTier
+  tierChangedAt?: number
 }
 
 /** Account shape safe to return over the wire (no hash). `admin` is derived from the
  *  MAGILOOM_ADMIN_EMAILS allowlist and gates the /admin metrics dashboard. */
-export interface PublicAccount { id: string; email: string; tier: AccountTier; admin: boolean }
+export interface PublicAccount {
+  id: string; email: string; tier: AccountTier; admin: boolean
+  prevTier?: AccountTier; tierChangedAt?: number
+}
 
 export interface RegisterResult { ok: true; account: PublicAccount; token: string }
 export interface AuthError      { ok: false; error: string }
@@ -100,7 +109,15 @@ export class AccountStore {
   }
 
   private toPublic(a: Account): PublicAccount {
-    return { id: a.id, email: a.email, tier: this.effectiveTier(a), admin: this.adminEmails.has(a.email) }
+    const tier = this.effectiveTier(a)
+    // Only carry plan history when the STORED tier is in force. An allowlisted pro
+    // email is already at the top plan, so surfacing a stale downgrade beside it
+    // would have the client offer grace against limits nobody is subject to.
+    const historic = tier === a.tier
+    return {
+      id: a.id, email: a.email, tier, admin: this.adminEmails.has(a.email),
+      ...(historic && a.prevTier ? { prevTier: a.prevTier, tierChangedAt: a.tierChangedAt } : {}),
+    }
   }
 
   /** Is this email on the admin allowlist? (Checked before creating/claiming an
@@ -175,10 +192,17 @@ export class AccountStore {
     return a ? this.toPublic(a) : null
   }
 
-  /** Set an account's plan — the hook a billing webhook flips to grant watch mode. */
+  /** Set an account's plan — the hook a billing webhook flips to grant watch mode.
+   *  Records the previous plan and when it changed so a downgrade can be given its
+   *  grace window (lib/tiers.ts) instead of taking effect the instant billing lapses.
+   *  A no-op change leaves the history alone, so re-asserting the same tier can't
+   *  quietly restart someone's grace clock. */
   setTier(id: string, tier: AccountTier): boolean {
     const a = this.data.accounts[id]
     if (!a) return false
+    if (a.tier === tier) return true
+    a.prevTier = a.tier
+    a.tierChangedAt = Date.now()
     a.tier = tier
     this.save()
     return true

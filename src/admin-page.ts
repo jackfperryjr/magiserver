@@ -96,6 +96,14 @@ export const ADMIN_HTML = `<!DOCTYPE html>
   .disk-rows > div.over b{color:var(--amber)}
   .disk-top b{color:var(--bright);font-weight:600}
   .disk-none{color:var(--dim);font-style:italic}
+  /* The pruner also runs at boot and every 6h; this is for when you don't want to
+     wait for either. It deletes, so it asks first. */
+  .card-h{display:flex;align-items:center;gap:12px}
+  .prune-btn{margin-left:auto;background:none;border:1px solid var(--border-hi);border-radius:6px;color:var(--muted);padding:4px 10px;font:inherit;font-size:11px;text-transform:none;letter-spacing:0;cursor:pointer}
+  .prune-btn:hover{border-color:var(--accent);color:var(--accent)}
+  .prune-btn:disabled{opacity:.5;cursor:default}
+  .prune-btn.confirm{border-color:var(--red);color:var(--red)}
+  .prune-msg{font-size:11px;color:var(--dim);text-transform:none;letter-spacing:0;font-weight:400}
   .foot{margin-top:20px;font-size:11px;color:var(--dim);font-family:'JetBrains Mono',monospace;display:flex;justify-content:space-between;flex-wrap:wrap;gap:10px}
   .foot a{color:var(--dim)}
   .signout{background:none;border:1px solid var(--border-hi);border-radius:6px;color:var(--muted);padding:4px 10px;font-size:11px;cursor:pointer}
@@ -137,7 +145,10 @@ export const ADMIN_HTML = `<!DOCTYPE html>
   </div>
 
   <div class="card" id="disk-card" style="margin-bottom:24px;display:none">
-    <div class="card-h">Storage · /data</div>
+    <div class="card-h">Storage · /data
+      <button id="prune-btn" class="prune-btn">Prune now</button>
+      <span id="prune-msg" class="prune-msg"></span>
+    </div>
     <div class="disk">
       <div class="bar">
         <span id="bar-lich" class="logs" style="width:0"></span>
@@ -290,6 +301,37 @@ export const ADMIN_HTML = `<!DOCTYPE html>
       return '<tr><td>'+name+'</td><td>'+dot+'</td><td>'+s.clients+'</td><td>'+fmtDur(now-s.connectedAt)+'</td><td>'+(flags||'—')+'</td></tr>';
     }).join('');
   }
+
+  // Two-step: the first click arms, the second runs. Same reasoning as the inline
+  // confirms in the app — a destructive action shouldn't be one stray click away,
+  // and a modal is more ceremony than this needs.
+  var pruneArmed = false;
+  (function wirePrune(){
+    var btn = document.getElementById('prune-btn'), msg = document.getElementById('prune-msg');
+    btn.onclick = function(){
+      if(!pruneArmed){
+        pruneArmed = true; btn.textContent = 'Confirm prune'; btn.className = 'prune-btn confirm';
+        msg.textContent = 'deletes logs past their retention';
+        setTimeout(function(){
+          if(!pruneArmed) return;
+          pruneArmed = false; btn.textContent = 'Prune now'; btn.className = 'prune-btn'; msg.textContent = '';
+        }, 5000);
+        return;
+      }
+      pruneArmed = false;
+      btn.disabled = true; btn.textContent = 'Pruning…'; btn.className = 'prune-btn'; msg.textContent = '';
+      fetch('/admin/prune', { method:'POST', headers:{ 'Authorization':'Bearer '+localStorage.getItem(TOKEN_LS) } })
+        .then(function(r){ return r.json(); })
+        .then(function(d){
+          msg.textContent = d.ok
+            ? 'reclaimed ' + fmtBytes(d.bytes) + ' from ' + d.removed + ' file(s)'
+            : (d.error || 'failed');
+          poll();
+        })
+        .catch(function(){ msg.textContent = 'failed'; })
+        .then(function(){ btn.disabled = false; btn.textContent = 'Prune now'; });
+    };
+  })();
 
   function poll(){
     var token = localStorage.getItem(TOKEN_LS);

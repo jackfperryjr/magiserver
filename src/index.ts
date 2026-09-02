@@ -10,9 +10,11 @@ import type { ServerContext } from './session'
 import { AccountStore } from './accounts'
 import { LogStore } from './lib/log-store'
 import { listLichLogs, readLichLog } from './lib/lich-log-store'
-import { pruneAllUsers, clampRetentionDays } from './lib/lich-log-prune'
+import { pruneAllUsers } from './lib/lich-log-prune'
+import { effectiveLimits, resolveRetentionDays } from './lib/tiers'
 import { diskSnapshot, invalidateDiskCache } from './lib/disk-usage'
 import { userLichHome } from './lich-home'
+import { exportUserLichData } from './lib/user-export'
 import {
   initPush, isPushReady, vapidPublicKey, addSubscription, removeSubscription,
 } from './push'
@@ -34,7 +36,7 @@ const ports = new PortAllocator()
 // Server-global messaging: in-memory presence + per-character JSON threads/contacts.
 // Identity is the authenticated character name (see message-hub.ts / message-store.ts).
 const hub   = new MessageHub(DATA_DIR)
-const server: ServerContext = { map, ports, hub, dataDir: DATA_DIR }
+const server: ServerContext = { map, ports, hub, dataDir: DATA_DIR, get accounts() { return ACCOUNTS_ENABLED ? accounts : null } }
 
 // Accounts (paid "watch mode" identity) are built but DORMANT: the /auth endpoints
 // and the gateway's account-keyed sessions only activate with this flag on. Off by
@@ -154,7 +156,8 @@ const httpServer = createServer((req, res) => {
   // /admin serves the viewer page; /admin/login authenticates a Magiloom account on
   // the admin allowlist; /admin/stats is the gated data feed (which DOES include
   // character names — for the operator's eyes only).
-  if (url.pathname === '/admin' || url.pathname === '/admin/login' || url.pathname === '/admin/stats') {
+  if (url.pathname === '/admin' || url.pathname === '/admin/login' ||
+      url.pathname === '/admin/stats' || url.pathname === '/admin/prune') {
     if (!ADMIN_ENABLED) { res.writeHead(404, cors); res.end(); return }
     const json = (code: number, body: unknown) => {
       res.writeHead(code, { 'Content-Type': 'application/json', ...cors }); res.end(JSON.stringify(body))
@@ -194,6 +197,16 @@ const httpServer = createServer((req, res) => {
           else      json(400, r)                               // e.g. password too short
         }
       }).catch(() => json(400, { ok: false, error: 'Bad request.' }))
+      return
+    }
+
+    // Run the pruner now, rather than waiting for the 6-hourly timer or a redeploy.
+    // POST because it deletes; same admin gate as the stats feed.
+    if (url.pathname === '/admin/prune' && req.method === 'POST') {
+      if (!authorized()) { json(401, { ok: false, error: 'Unauthorized' }); return }
+      const r = pruneAllUsers(DATA_DIR, budgetForUser)
+      invalidateDiskCache()
+      json(200, { ok: true, ...r })
       return
     }
 
@@ -266,7 +279,8 @@ const httpServer = createServer((req, res) => {
   // Logs can contain private conversation, so this stays account-only forever —
   // don't add a shared-token path to it later.
   if (ACCOUNTS_ENABLED && (url.pathname === '/logs' || url.pathname === '/logs/read' ||
-                           url.pathname === '/logs/events' || url.pathname === '/logs/lich')) {
+                           url.pathname === '/logs/events' || url.pathname === '/logs/lich' ||
+                           url.pathname === '/logs/export')) {
     const json = (code: number, body: unknown) => {
       res.writeHead(code, { 'Content-Type': 'application/json', ...cors }); res.end(JSON.stringify(body))
     }
@@ -286,6 +300,28 @@ const httpServer = createServer((req, res) => {
       let lich: ReturnType<typeof listLichLogs> = []
       try { lich = listLichLogs(userLichHome(DATA_DIR, `acct-${account.id}`)) } catch { /* none */ }
       json(200, { ok: true, files: store.listFiles(), lich })
+      return
+    }
+
+    // Everything of theirs, as a zip. An HTTP route rather than a gateway channel
+    // because the payload is binary and can run to hundreds of MB — pushing that
+    // through the WebSocket's JSON envelope would mean base64 and the whole archive
+    // in memory. Streams instead, one file at a time.
+    if (url.pathname === '/logs/export') {
+      const home = userLichHome(DATA_DIR, `acct-${account.id}`)
+      const stamp = new Date().toISOString().slice(0, 10)
+      res.writeHead(200, {
+        'Content-Type': 'application/zip',
+        'Content-Disposition': `attachment; filename="lantern-lich-${stamp}.zip"`,
+        ...cors,
+      })
+      try {
+        exportUserLichData(home, res, { includeLogs: url.searchParams.get('logs') !== '0' })
+      } catch {
+        // Headers are already out, so the only honest signal left is a short file —
+        // better than hanging the download.
+      }
+      res.end()
       return
     }
 
@@ -358,10 +394,30 @@ httpServer.listen(PORT, () => {
 // every six hours thereafter to catch long-lived deploys.
 const PRUNE_INTERVAL_MS = 6 * 60 * 60 * 1000
 
+/**
+ * The storage allowance for one data bucket. Signed-in users bucket as `acct-<id>`
+ * (see gateway.ts), so the plan is resolved from the account store; anything else —
+ * a legacy device bucket from before sign-in was required — gets the free limits.
+ *
+ * The user's own retention setting is a REQUEST: resolveRetentionDays clamps it to
+ * the plan server-side, so a patched settings.json can't buy retention.
+ */
+function budgetForUser(userId: string): { maxAgeDays: number; maxBytes: number } {
+  const id = /^acct-(.+)$/.exec(userId)?.[1]
+  const account = id ? accounts.getAccount(id) : null
+  const state = account
+    ? { tier: account.tier, prevTier: account.prevTier, tierChangedAt: account.tierChangedAt }
+    : { tier: 'free' as const }
+  const limits = effectiveLimits(state)
+  return {
+    maxAgeDays: resolveRetentionDays(state, users.get(userId).settings.get('lichLogRetentionDays')),
+    maxBytes:   limits.maxBytes,
+  }
+}
+
 function runLogPrune(): void {
   try {
-    const r = pruneAllUsers(DATA_DIR, id =>
-      clampRetentionDays(users.get(id).settings.get('lichLogRetentionDays')))
+    const r = pruneAllUsers(DATA_DIR, budgetForUser)
     if (r.removed) {
       // The dashboard's log-size walk is cached for a minute; pruning invalidates it
       // so /admin doesn't keep reporting space that has already been reclaimed.
