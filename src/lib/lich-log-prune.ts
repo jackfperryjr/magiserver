@@ -63,6 +63,13 @@ export interface PruneOptions {
   dropFlattened?: boolean
   /** Report what would go without touching the disk. */
   dryRun?: boolean
+  /**
+   * Absolute mtime cutoff — anything older goes. Overrides maxAgeDays when set, and
+   * exists because the joint byte ceiling needs finer granularity than whole days:
+   * it derives one shared cutoff across both log sets so the oldest data goes first
+   * regardless of which set holds it (see jointCutoff).
+   */
+  cutoffMs?: number
 }
 
 export interface PruneResult {
@@ -104,7 +111,7 @@ export function pruneLichLogs(lichHome: string, opts: PruneOptions = {}): PruneR
   }
   if (!all.length) return { ...EMPTY }
 
-  const cutoff = Date.now() - clampRetentionDays(maxAgeDays) * 86_400_000
+  const cutoff = opts.cutoffMs ?? (Date.now() - clampRetentionDays(maxAgeDays) * 86_400_000)
   const doomed = new Set<LichLogEntry>()
 
   for (const e of all) {
@@ -183,7 +190,7 @@ export function pruneMagiloomLogs(userDir: string, opts: PruneOptions = {}): Pru
     return { names, size, mtime: f.mtime }
   })
 
-  const cutoff = Date.now() - clampRetentionDays(maxAgeDays) * 86_400_000
+  const cutoff = opts.cutoffMs ?? (Date.now() - clampRetentionDays(maxAgeDays) * 86_400_000)
   const doomed = new Set(items.filter(i => i.mtime < cutoff))
 
   let hitByteCeiling = false
@@ -270,14 +277,29 @@ export interface PruneAllResult {
   byKind: { lichLogs: number; magiloomLogs: number; lichMaps: number }
 }
 
+/** The storage allowance a single user is subject to. */
+export interface UserBudget {
+  maxAgeDays: number
+  /** Total across BOTH log sets — see the note in pruneAllUsers. */
+  maxBytes: number
+}
+
 /**
- * Prune every user under DATA_DIR/users/. `retentionFor` lets the caller resolve
- * each user's own setting; users with nothing to prune are skipped silently.
+ * Prune every user under DATA_DIR/users/. `budgetFor` resolves each user's plan
+ * limits; users with nothing to prune are skipped silently.
+ *
+ * THE BYTE CEILING IS ONE BUDGET PER USER, spanning Lich's logs and Lantern's
+ * together. Giving each kind its own ceiling — as the first version did — meant a
+ * "500 MB per user" limit silently permitted a gigabyte, and left the dashboard
+ * flagging accounts as over a limit no pruner would ever enforce. The two sets are
+ * merged, sorted oldest-first, and trimmed as one list, so the number quoted to a
+ * user is the number that actually binds.
  */
 export function pruneAllUsers(
   dataDir: string,
-  retentionFor: (userId: string) => number = () => DEFAULT_RETENTION_DAYS,
-  opts: Omit<PruneOptions, 'maxAgeDays'> = {},
+  budgetFor: (userId: string) => UserBudget =
+    () => ({ maxAgeDays: DEFAULT_RETENTION_DAYS, maxBytes: MAX_BYTES_PER_USER }),
+  opts: Omit<PruneOptions, 'maxAgeDays' | 'maxBytes'> = {},
 ): PruneAllResult {
   const usersDir = join(dataDir, 'users')
   const byKind = { lichLogs: 0, magiloomLogs: 0, lichMaps: 0 }
@@ -288,24 +310,90 @@ export function pruneAllUsers(
     const userDir = join(usersDir, id)
     if (!isDir(userDir)) continue
     const home = userLichHome(dataDir, id)
-    const days = retentionFor(id)
+    const { maxAgeDays, maxBytes } = budgetFor(id)
     let touched = false
 
-    for (const [kind, run] of [
-      ['lichLogs',     () => pruneLichLogs(home, { ...opts, maxAgeDays: days })],
-      ['magiloomLogs', () => pruneMagiloomLogs(userDir, { ...opts, maxAgeDays: days })],
-      ['lichMaps',     () => pruneLichMapData(home, { dryRun: opts.dryRun })],
-    ] as const) {
-      const r = run()
-      if (!r.removed) continue
+    const add = (kind: keyof typeof byKind, r: PruneResult): void => {
+      if (!r.removed) return
       touched = true
       removed += r.removed
       bytes += r.bytes
       byKind[kind] += r.bytes
     }
+
+    // Maps first and unconditionally: they're pure duplicates, so reclaiming them
+    // never costs the user anything and shouldn't spend any of the log budget.
+    add('lichMaps', pruneLichMapData(home, { dryRun: opts.dryRun }))
+
+    // Age pass on each set independently — age is a per-file property, so there's
+    // nothing to coordinate. Pass Infinity for bytes so the ceiling doesn't fire
+    // twice; it's applied jointly below.
+    add('lichLogs',     pruneLichLogs(home, { ...opts, maxAgeDays, maxBytes: Infinity }))
+    add('magiloomLogs', pruneMagiloomLogs(userDir, { ...opts, maxAgeDays, maxBytes: Infinity }))
+
+    // Joint ceiling over whatever survived, applied as ONE date cutoff across both
+    // sets. Trimming the sets in sequence instead would meet the budget but skew:
+    // with equal holdings the first set absorbs the whole cut, so a user loses old
+    // Lich sessions while keeping OLDER Lantern logs of the same week. Deriving a
+    // shared cutoff makes the rule the one the UI actually states — the newest
+    // <budget> is kept, and the oldest data goes first whichever log it came from.
+    const lichLeft = lichLogBytes(home)
+    const magLeft  = magiloomLogBytes(userDir)
+    if (lichLeft + magLeft > maxBytes) {
+      const cutoff = jointCutoff(home, userDir, maxBytes)
+      add('lichLogs',     pruneLichLogs(home, { ...opts, cutoffMs: cutoff, maxBytes: Infinity }))
+      add('magiloomLogs', pruneMagiloomLogs(userDir, { ...opts, cutoffMs: cutoff, maxBytes: Infinity }))
+    }
+
     if (touched) users++
   }
   return { users, removed, bytes, byKind }
+}
+
+/**
+ * The mtime below which files must go for BOTH log sets together to fit `maxBytes`.
+ * Merge every candidate, walk newest-first accumulating size, and return the mtime
+ * at which the budget runs out — so what survives is exactly the newest <budget>
+ * worth of logs, regardless of which set each file came from.
+ */
+function jointCutoff(lichHome: string, userDir: string, maxBytes: number): number {
+  const items: { mtime: number; size: number }[] = []
+  try {
+    for (const e of listLichLogs(lichHome, { xmlOnly: false, limit: Number.MAX_SAFE_INTEGER })) {
+      items.push({ mtime: e.mtime, size: e.size })
+    }
+  } catch { /* none */ }
+  const magDir = join(userDir, 'logs')
+  try {
+    for (const f of new LogStore(userDir).listFiles()) {
+      let size = f.size
+      if (f.events) { try { size += statSync(join(magDir, eventName(f.name))).size } catch { /* gone */ } }
+      items.push({ mtime: f.mtime, size })
+    }
+  } catch { /* none */ }
+
+  items.sort((a, b) => b.mtime - a.mtime)
+  let running = 0
+  for (const it of items) {
+    running += it.size
+    // The first file that pushes us over is itself too old to keep, so the cutoff
+    // sits just above it — everything from here down goes.
+    if (running > maxBytes) return it.mtime + 1
+  }
+  return 0   // everything fits; nothing to cut
+}
+
+/** Bytes held by Magiloom's own logs for a user, sidecars included. */
+export function magiloomLogBytes(userDir: string): number {
+  const dir = join(userDir, 'logs')
+  if (!existsSync(dir)) return 0
+  try {
+    return new LogStore(userDir).listFiles().reduce((s, f) => {
+      let n = f.size
+      if (f.events) { try { n += statSync(join(dir, eventName(f.name))).size } catch { /* gone */ } }
+      return s + n
+    }, 0)
+  } catch { return 0 }
 }
 
 /** Total bytes of Lich logs a user is holding — for the admin gauge and tests. */

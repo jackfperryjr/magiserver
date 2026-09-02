@@ -16,6 +16,8 @@ import type { MessageHub } from './message-hub'
 import { TriggerEngine, DEFAULT_PUSH, type NotifRule, type PushConfig } from './trigger-engine'
 import { provisionLichHome, ensureUserScriptsDir, sharedLichRoot, writeLichEntry, userLichHome } from './lich-home'
 import { listLichLogs, readLichLog, deleteLichLog } from './lib/lich-log-store'
+import { effectiveLimits, resolveRetentionDays, graceRemainingMs, type TierInfo, type TierState } from './lib/tiers'
+import type { AccountStore } from './accounts'
 import { listFiles, readFile, writeFile, deleteFile } from './lich-files'
 import { notify } from './push'
 
@@ -28,6 +30,10 @@ export interface ServerContext {
   ports: PortAllocator   // Lich frontend-port pool (multi-instance support)
   hub: MessageHub        // server-global messaging presence + router (message-hub.ts)
   dataDir: string
+  // Plan lookup for storage limits. Null when the account layer is off, in which
+  // case every session is treated as free — the conservative default, so a
+  // misconfigured deploy can't hand out paid retention.
+  accounts?: AccountStore | null
 }
 
 /**
@@ -308,6 +314,11 @@ export class Session {
 
       // game logs — the PWA's only way to reach them (they live on the server).
       // Confined to this user's logs/ dir and name-jailed in log-store.ts.
+      // What this account's plan allows, so the client can render its retention
+      // control and its "download before this expires" warning with real numbers
+      // instead of guessing. Read-only — the limits are enforced server-side.
+      case 'account:limits': return this.tierInfo()
+
       case 'logs:list':   return this.log.listFiles()
       case 'logs:read':   return this.log.readFile(a[0] as string)
       case 'logs:delete': return this.log.deleteFile(a[0] as string)
@@ -594,6 +605,28 @@ export class Session {
    *  the user id (never from request arguments), so no call can reach another's. */
   private lichHomeDir(): string {
     return userLichHome(this.server.dataDir, this.user.userId)
+  }
+
+  /** This account's storage plan, resolved the same way the pruner resolves it —
+   *  including downgrade grace — so what the client shows matches what will
+   *  actually be deleted. */
+  private tierInfo(): TierInfo {
+    const id = /^acct-(.+)$/.exec(this.user.userId)?.[1]
+    const account = id && this.server.accounts ? this.server.accounts.getAccount(id) : null
+    const state: TierState = account
+      ? { tier: account.tier, prevTier: account.prevTier, tierChangedAt: account.tierChangedAt }
+      : { tier: 'free' }
+    const limits = effectiveLimits(state)
+    return {
+      tier: state.tier,
+      maxDays: limits.maxDays,
+      maxBytes: limits.maxBytes,
+      choices: limits.choices,
+      effectiveDays: resolveRetentionDays(
+        state, this.user.settings.get('lichLogRetentionDays')),
+      graceMs: graceRemainingMs(state),
+      ...(state.prevTier ? { prevTier: state.prevTier } : {}),
+    }
   }
 
   /** True when `name` is the character this session is currently connected as
