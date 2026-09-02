@@ -26,6 +26,12 @@ export interface AppSettings {
   // CharScopedSettings.logging); this survives only as the fallback default so an
   // existing setup keeps logging until each character sets its own preference.
   logging?:      boolean
+  // How long the server keeps this user's Lich session logs, in days. Global rather
+  // than per character because Lich writes them into one per-user home, so there is
+  // no per-character disk to bound. Absent → DEFAULT_RETENTION_DAYS; always read
+  // through clampRetentionDays, since the operator ceiling can move under a stored
+  // value (see lich-log-prune.ts).
+  lichLogRetentionDays?: number
 }
 
 // The subset of settings that can be overridden per character.

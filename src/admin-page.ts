@@ -68,6 +68,28 @@ export const ADMIN_HTML = `<!DOCTYPE html>
   .badge.paid{background:rgba(255,171,94,.14);color:var(--amber)}
   .badge.detached{background:var(--accent-dim);color:var(--muted)}
   .empty{padding:34px 18px;text-align:center;color:var(--dim);font-style:italic}
+
+  /* storage gauge */
+  .disk{padding:18px}
+  .bar{height:10px;background:var(--panel);border:1px solid var(--border-hi);border-radius:100px;overflow:hidden;display:flex}
+  .bar span{display:block;height:100%;transition:width .3s}
+  .bar .used{background:var(--green)}
+  .bar .used.warn{background:var(--amber)}
+  .bar .used.crit{background:var(--red)}
+  /* Lich logs are drawn as a slice OF the used portion, so it reads as "this much
+     of what's gone is logs" rather than as a second, unrelated total. */
+  .bar .logs{background:var(--accent);opacity:.85}
+  .disk-legend{display:flex;flex-wrap:wrap;gap:16px;margin-top:12px;font-size:12px;color:var(--muted)}
+  .disk-legend i{display:inline-block;width:9px;height:9px;border-radius:2px;margin-right:6px;vertical-align:middle;font-style:normal}
+  .disk-legend b{color:var(--bright);font-weight:600;font-family:'JetBrains Mono',monospace}
+  .disk-top{margin-top:16px;font-size:12px}
+  .disk-top-h{color:var(--dim);text-transform:uppercase;letter-spacing:.06em;font-size:11px;font-weight:600;margin-bottom:7px}
+  /* Scoped to the rows container. A bare ".disk-top div" also matched the container
+     itself, turning it into a flex row and laying every account out on one line. */
+  .disk-rows > div{display:flex;justify-content:space-between;gap:16px;padding:3px 0;font-family:'JetBrains Mono',monospace;color:var(--muted)}
+  .disk-rows > div.over b{color:var(--amber)}
+  .disk-top b{color:var(--bright);font-weight:600}
+  .disk-none{color:var(--dim);font-style:italic}
   .foot{margin-top:20px;font-size:11px;color:var(--dim);font-family:'JetBrains Mono',monospace;display:flex;justify-content:space-between;flex-wrap:wrap;gap:10px}
   .foot a{color:var(--dim)}
   .signout{background:none;border:1px solid var(--border-hi);border-radius:6px;color:var(--muted);padding:4px 10px;font-size:11px;cursor:pointer}
@@ -105,6 +127,24 @@ export const ADMIN_HTML = `<!DOCTYPE html>
     <div class="tile"><div class="k">Sessions held</div><div id="t-total" class="v">–</div></div>
     <div class="tile"><div class="k">Lich ports</div><div id="t-lich" class="v">–</div></div>
     <div class="tile"><div class="k">Uptime</div><div id="t-uptime" class="v" style="font-size:28px">–</div></div>
+    <div class="tile"><div class="k">Disk used</div><div id="t-disk" class="v">–</div></div>
+  </div>
+
+  <div class="card" id="disk-card" style="margin-bottom:24px;display:none">
+    <div class="card-h">Storage · /data</div>
+    <div class="disk">
+      <div class="bar"><span id="bar-logs" class="logs" style="width:0"></span><span id="bar-used" class="used" style="width:0"></span></div>
+      <div class="disk-legend">
+        <span><i style="background:var(--accent)"></i>Lich logs <b id="d-logs">–</b></span>
+        <span><i id="d-other-sw" style="background:var(--green)"></i>Other used <b id="d-other">–</b></span>
+        <span><i style="background:var(--panel);border:1px solid var(--border-hi)"></i>Free <b id="d-free">–</b></span>
+        <span>Total <b id="d-total">–</b></span>
+      </div>
+      <div class="disk-top">
+        <div class="disk-top-h">Largest log holders</div>
+        <div id="d-top" class="disk-rows"></div>
+      </div>
+    </div>
   </div>
 
   <div class="card">
@@ -149,6 +189,60 @@ export const ADMIN_HTML = `<!DOCTYPE html>
   }
   function esc(t){var d=document.createElement('div');d.textContent=t;return d.innerHTML;}
 
+  function fmtBytes(n){
+    if(n==null) return '–';
+    if(n < 1024) return n+' B';
+    var u=['KB','MB','GB','TB'], i=-1;
+    do { n/=1024; i++; } while(n>=1024 && i<u.length-1);
+    return (n<10 ? n.toFixed(1) : Math.round(n)) + ' ' + u[i];
+  }
+
+  // Volume headroom, with Lich logs called out as a slice of what's used — they're
+  // the only thing on /data that grows without a natural bound, so when the bar
+  // fills they're the first place to look.
+  function renderDisk(disk){
+    var card = document.getElementById('disk-card');
+    if(!disk || !disk.volume){
+      // statfs unavailable — hide the card rather than show empty tiles.
+      card.style.display='none';
+      document.getElementById('t-disk').textContent='–';
+      return;
+    }
+    card.style.display='block';
+    var v = disk.volume, logs = (disk.lichLogs && disk.lichLogs.bytes) || 0;
+    // Logs can't exceed used; clamp so a stale cached walk can't overflow the bar.
+    if(logs > v.used) logs = v.used;
+
+    var tile = document.getElementById('t-disk');
+    tile.textContent = v.pct + '%';
+    tile.className = 'v' + (v.pct >= 85 ? '' : v.pct >= 70 ? ' accent' : ' green');
+    if(v.pct >= 85) tile.style.color = 'var(--red)'; else tile.style.color = '';
+
+    var logsPct = (logs / v.total) * 100;
+    var otherPct = ((v.used - logs) / v.total) * 100;
+    document.getElementById('bar-logs').style.width = logsPct.toFixed(2) + '%';
+    var used = document.getElementById('bar-used');
+    used.style.width = otherPct.toFixed(2) + '%';
+    used.className = 'used' + (v.pct >= 85 ? ' crit' : v.pct >= 70 ? ' warn' : '');
+    // Keep the legend swatch on the same colour as the segment it labels — it shifts
+    // green → amber → red with the bar, and a fixed green would contradict it.
+    document.getElementById('d-other-sw').style.background =
+      v.pct >= 85 ? 'var(--red)' : v.pct >= 70 ? 'var(--amber)' : 'var(--green)';
+
+    document.getElementById('d-logs').textContent  = fmtBytes(logs);
+    document.getElementById('d-other').textContent = fmtBytes(v.used - logs);
+    document.getElementById('d-free').textContent  = fmtBytes(v.free);
+    document.getElementById('d-total').textContent = fmtBytes(v.total);
+
+    var top = (disk.lichLogs && disk.lichLogs.top) || [];
+    var el = document.getElementById('d-top');
+    if(!top.length){ el.innerHTML = '<span class="disk-none">No Lich logs on disk.</span>'; return; }
+    el.innerHTML = top.map(function(u){
+      return '<div class="' + (u.overCeiling ? 'over' : '') + '"><span>' + esc(u.userId) +
+        (u.overCeiling ? ' (over ceiling)' : '') + '</span><b>' + fmtBytes(u.bytes) + '</b></div>';
+    }).join('');
+  }
+
   function render(d){
     document.getElementById('t-online').textContent = d.online;
     document.getElementById('t-playing').textContent = d.playing;
@@ -157,6 +251,7 @@ export const ADMIN_HTML = `<!DOCTYPE html>
     document.getElementById('t-lich').textContent = d.lichPortsInUse;
     document.getElementById('t-uptime').textContent = fmtDur(d.uptimeSec*1000);
     document.getElementById('foot-push').textContent = 'push: ' + (d.push ? 'ready' : 'off');
+    renderDisk(d.disk);
     var st = document.getElementById('status');
     st.className='status'; st.innerHTML='live · <b>updated ' + new Date().toLocaleTimeString() + '</b>';
 
