@@ -1,5 +1,5 @@
 import { join, sep } from 'path'
-import { existsSync, readdirSync, statSync, openSync, readSync, closeSync } from 'fs'
+import { existsSync, readdirSync, statSync, openSync, readSync, closeSync, unlinkSync } from 'fs'
 
 // ── Reading the Lich logs a user's server sessions produced ─────────────────────
 // When the server runs Lich for someone, Lich keeps its own logs inside that user's
@@ -140,4 +140,32 @@ export function readLichLog(lichHome: string, relPath: string, maxBytes = 8 * 10
   let content = buf.toString('utf8')
   if (start > 0) content = content.slice(content.indexOf('\n') + 1)
   return { path: rel, content, size, truncated: start > 0 }
+}
+
+/**
+ * Delete one Lich log. Same jail as readLichLog — the relative path must match the
+ * only shape Lich writes, and the resolved path must still sit under this user's
+ * logs dir — because the consequence of a bad path here is worse than a bad read.
+ *
+ * Deleting the .xml also drops the .log beside it (and vice versa): they are one
+ * session in two shapes, so removing half would leave a partial record that reads
+ * as a complete one.
+ */
+export function deleteLichLog(lichHome: string, relPath: string): { removed: string[] } {
+  const rel = relPath.replace(/\\/g, '/')
+  if (!LICH_PATH_RE.test(rel)) throw new Error('Not a Lich log path: ' + relPath)
+
+  const root = lichLogsDir(lichHome)
+  const abs = join(root, ...rel.split('/'))
+  if (!abs.startsWith(root + sep)) throw new Error('Outside the log directory')
+
+  const removed: string[] = []
+  for (const ext of ['.xml', '.log']) {
+    const p = abs.replace(/\.(?:xml|log)$/i, ext)
+    try {
+      if (existsSync(p) && statSync(p).isFile()) { unlinkSync(p); removed.push(ext) }
+    } catch { /* leave what we can't remove */ }
+  }
+  if (!removed.length) throw new Error('Not found: ' + rel)
+  return { removed }
 }

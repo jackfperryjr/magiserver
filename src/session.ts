@@ -14,7 +14,8 @@ import type { UserContext } from './user-context'
 import type { PortAllocator } from './port-allocator'
 import type { MessageHub } from './message-hub'
 import { TriggerEngine, DEFAULT_PUSH, type NotifRule, type PushConfig } from './trigger-engine'
-import { provisionLichHome, ensureUserScriptsDir, sharedLichRoot, writeLichEntry } from './lich-home'
+import { provisionLichHome, ensureUserScriptsDir, sharedLichRoot, writeLichEntry, userLichHome } from './lich-home'
+import { listLichLogs, readLichLog, deleteLichLog } from './lib/lich-log-store'
 import { listFiles, readFile, writeFile, deleteFile } from './lich-files'
 import { notify } from './push'
 
@@ -307,8 +308,23 @@ export class Session {
 
       // game logs — the PWA's only way to reach them (they live on the server).
       // Confined to this user's logs/ dir and name-jailed in log-store.ts.
-      case 'logs:list': return this.log.listFiles()
-      case 'logs:read': return this.log.readFile(a[0] as string)
+      case 'logs:list':   return this.log.listFiles()
+      case 'logs:read':   return this.log.readFile(a[0] as string)
+      case 'logs:delete': return this.log.deleteFile(a[0] as string)
+
+      // LICH's own session logs, which are a different set from the above: Lich writes
+      // them itself, per character and date, inside this user's Lich home. They were
+      // previously reachable only through the account-gated /logs HTTP route used by
+      // the web analyzer, which left the app with no way to see or clear them at all.
+      // Path-jailed in lich-log-store.ts; the home is derived from the user id, never
+      // from anything the caller sends.
+      case 'lich:list-logs':
+        return listLichLogs(this.lichHomeDir(), {
+          xmlOnly: (a[0] as boolean | undefined) ?? false,
+          limit: 400,
+        })
+      case 'lich:read-log':   return readLichLog(this.lichHomeDir(), a[0] as string)
+      case 'lich:delete-log': return deleteLichLog(this.lichHomeDir(), a[0] as string)
 
       // avatars / portraits. Publishing/removing a shared avatar is gated to the
       // character you're actually connected as — you must be logged in to DR to set
@@ -572,6 +588,12 @@ export class Session {
   /** Ensure this user's writable Lich dirs exist and return their scripts dir. */
   private userScriptsDir(): string {
     return ensureUserScriptsDir(this.server.dataDir, this.user.userId)
+  }
+
+  /** This user's Lich home — the root the log channels are jailed to. Derived from
+   *  the user id (never from request arguments), so no call can reach another's. */
+  private lichHomeDir(): string {
+    return userLichHome(this.server.dataDir, this.user.userId)
   }
 
   /** True when `name` is the character this session is currently connected as
