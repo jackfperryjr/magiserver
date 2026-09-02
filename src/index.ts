@@ -10,6 +10,8 @@ import type { ServerContext } from './session'
 import { AccountStore } from './accounts'
 import { LogStore } from './lib/log-store'
 import { listLichLogs, readLichLog } from './lib/lich-log-store'
+import { pruneAllUsers, clampRetentionDays } from './lib/lich-log-prune'
+import { diskSnapshot, invalidateDiskCache } from './lib/disk-usage'
 import { userLichHome } from './lich-home'
 import {
   initPush, isPushReady, vapidPublicKey, addSubscription, removeSubscription,
@@ -205,6 +207,9 @@ const httpServer = createServer((req, res) => {
         uptimeSec:      process.uptime(),
         lichPortsInUse: ports.inUse,
         push:           isPushReady(),
+        // Volume headroom + what Lich logs are costing. The log walk behind this is
+        // cached (see disk-usage.ts) because /admin polls every few seconds.
+        disk:           diskSnapshot(DATA_DIR),
         ...snap,
       })
       return
@@ -345,7 +350,39 @@ httpServer.listen(PORT, () => {
   }
 })
 
+// ── Lich log retention ──────────────────────────────────────────────────────────
+// Lich never removes its own session logs, so without this /data fills and every
+// uncaught write in the server starts throwing ENOSPC at whichever client happened
+// to touch it. Runs at boot — which is also what clears a volume that has ALREADY
+// filled, since a redeploy is the one thing guaranteed to happen after that — and
+// every six hours thereafter to catch long-lived deploys.
+const PRUNE_INTERVAL_MS = 6 * 60 * 60 * 1000
+
+function runLogPrune(): void {
+  try {
+    const r = pruneAllUsers(DATA_DIR, id =>
+      clampRetentionDays(users.get(id).settings.get('lichLogRetentionDays')))
+    if (r.removed) {
+      // The dashboard's log-size walk is cached for a minute; pruning invalidates it
+      // so /admin doesn't keep reporting space that has already been reclaimed.
+      invalidateDiskCache()
+      // eslint-disable-next-line no-console
+      console.log(`[magiloom-server] pruned ${r.removed} Lich log(s), ` +
+        `${(r.bytes / 1048576).toFixed(0)} MB reclaimed across ${r.users} user(s)`)
+    }
+  } catch (err) {
+    // Retention is housekeeping; a failure here must not stop the server booting.
+    // eslint-disable-next-line no-console
+    console.warn('[magiloom-server] log prune failed:', err)
+  }
+}
+
+runLogPrune()
+const pruneTimer = setInterval(runLogPrune, PRUNE_INTERVAL_MS)
+pruneTimer.unref()
+
 function shutdown(): void {
+  clearInterval(pruneTimer)
   users.dispose()
   map.dispose()
   httpServer.close()
