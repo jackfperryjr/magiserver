@@ -79,6 +79,12 @@ export const ADMIN_HTML = `<!DOCTYPE html>
   /* Lich logs are drawn as a slice OF the used portion, so it reads as "this much
      of what's gone is logs" rather than as a second, unrelated total. */
   .bar .logs{background:var(--accent);opacity:.85}
+  /* The three fixed slices must stay distinguishable from EACH OTHER and from the
+     "other used" segment, which cycles green → amber → red with disk pressure. An
+     orange/purple pair collapsed to ~11° of hue separation against amber and against
+     the periwinkle beside it; magenta + cyan holds ≥33° in every state. */
+  .bar .lantern{background:#d96ba8}
+  .bar .maps{background:#3fb0c9}
   .disk-legend{display:flex;flex-wrap:wrap;gap:16px;margin-top:12px;font-size:12px;color:var(--muted)}
   .disk-legend i{display:inline-block;width:9px;height:9px;border-radius:2px;margin-right:6px;vertical-align:middle;font-style:normal}
   .disk-legend b{color:var(--bright);font-weight:600;font-family:'JetBrains Mono',monospace}
@@ -133,9 +139,16 @@ export const ADMIN_HTML = `<!DOCTYPE html>
   <div class="card" id="disk-card" style="margin-bottom:24px;display:none">
     <div class="card-h">Storage · /data</div>
     <div class="disk">
-      <div class="bar"><span id="bar-logs" class="logs" style="width:0"></span><span id="bar-used" class="used" style="width:0"></span></div>
+      <div class="bar">
+        <span id="bar-lich" class="logs" style="width:0"></span>
+        <span id="bar-lantern" class="lantern" style="width:0"></span>
+        <span id="bar-maps" class="maps" style="width:0"></span>
+        <span id="bar-used" class="used" style="width:0"></span>
+      </div>
       <div class="disk-legend">
         <span><i style="background:var(--accent)"></i>Lich logs <b id="d-logs">–</b></span>
+        <span><i style="background:#d96ba8"></i>Lantern logs <b id="d-lantern">–</b></span>
+        <span><i style="background:#3fb0c9"></i>Lich maps <b id="d-maps">–</b></span>
         <span><i id="d-other-sw" style="background:var(--green)"></i>Other used <b id="d-other">–</b></span>
         <span><i style="background:var(--panel);border:1px solid var(--border-hi)"></i>Free <b id="d-free">–</b></span>
         <span>Total <b id="d-total">–</b></span>
@@ -209,30 +222,40 @@ export const ADMIN_HTML = `<!DOCTYPE html>
       return;
     }
     card.style.display='block';
-    var v = disk.volume, logs = (disk.lichLogs && disk.lichLogs.bytes) || 0;
-    // Logs can't exceed used; clamp so a stale cached walk can't overflow the bar.
-    if(logs > v.used) logs = v.used;
+    var v = disk.volume;
+    var b = (disk.lichLogs && disk.lichLogs.breakdown) || {};
+    var lich = b.lichLogs || 0, lantern = b.magiloomLogs || 0, maps = b.lichMaps || 0;
+    // The tracked slices can't exceed what's used; scale them down together if a
+    // stale cached walk would otherwise overflow the bar.
+    var tracked = lich + lantern + maps;
+    if(tracked > v.used && tracked > 0){
+      var k = v.used / tracked;
+      lich *= k; lantern *= k; maps *= k; tracked = v.used;
+    }
 
     var tile = document.getElementById('t-disk');
     tile.textContent = v.pct + '%';
     tile.className = 'v' + (v.pct >= 85 ? '' : v.pct >= 70 ? ' accent' : ' green');
     if(v.pct >= 85) tile.style.color = 'var(--red)'; else tile.style.color = '';
 
-    var logsPct = (logs / v.total) * 100;
-    var otherPct = ((v.used - logs) / v.total) * 100;
-    document.getElementById('bar-logs').style.width = logsPct.toFixed(2) + '%';
+    var pct = function(n){ return ((n / v.total) * 100).toFixed(2) + '%'; };
+    document.getElementById('bar-lich').style.width    = pct(lich);
+    document.getElementById('bar-lantern').style.width = pct(lantern);
+    document.getElementById('bar-maps').style.width    = pct(maps);
     var used = document.getElementById('bar-used');
-    used.style.width = otherPct.toFixed(2) + '%';
+    used.style.width = pct(v.used - tracked);
     used.className = 'used' + (v.pct >= 85 ? ' crit' : v.pct >= 70 ? ' warn' : '');
     // Keep the legend swatch on the same colour as the segment it labels — it shifts
     // green → amber → red with the bar, and a fixed green would contradict it.
     document.getElementById('d-other-sw').style.background =
       v.pct >= 85 ? 'var(--red)' : v.pct >= 70 ? 'var(--amber)' : 'var(--green)';
 
-    document.getElementById('d-logs').textContent  = fmtBytes(logs);
-    document.getElementById('d-other').textContent = fmtBytes(v.used - logs);
-    document.getElementById('d-free').textContent  = fmtBytes(v.free);
-    document.getElementById('d-total').textContent = fmtBytes(v.total);
+    document.getElementById('d-logs').textContent    = fmtBytes(lich);
+    document.getElementById('d-lantern').textContent = fmtBytes(lantern);
+    document.getElementById('d-maps').textContent    = fmtBytes(maps);
+    document.getElementById('d-other').textContent   = fmtBytes(v.used - tracked);
+    document.getElementById('d-free').textContent    = fmtBytes(v.free);
+    document.getElementById('d-total').textContent   = fmtBytes(v.total);
 
     var top = (disk.lichLogs && disk.lichLogs.top) || [];
     var el = document.getElementById('d-top');

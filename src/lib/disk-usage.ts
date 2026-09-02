@@ -1,5 +1,5 @@
 import { join } from 'path'
-import { existsSync, readdirSync, statfsSync } from 'fs'
+import { existsSync, readdirSync, statSync, statfsSync } from 'fs'
 import { lichLogsDir } from './lich-log-store'
 import { lichLogBytes, MAX_BYTES_PER_USER } from './lich-log-prune'
 import { userLichHome } from '../lich-home'
@@ -23,13 +23,29 @@ export interface VolumeUsage {
   pct:   number
 }
 
+/** The categories under /data that actually grow, kept apart so the dashboard can't
+ *  imply the disk is healthy just because one of them is. */
+export interface UsageBreakdown {
+  /** Lich's own session logs (DR-<Char>/YYYY/MM/*.xml|.log). */
+  lichLogs: number
+  /** Magiloom's game-output logs + their .jsonl sidecars. */
+  magiloomLogs: number
+  /** Lich's prime-map downloads under <home>/data/<GAME>/. */
+  lichMaps: number
+  /** Everything else in the user tree — profiles, custom scripts, lich.db3, backups. */
+  otherUser: number
+}
+
 export interface LichLogUsage {
+  /** Total across every tracked category, i.e. the whole per-user tree. */
   bytes: number
   users: number
   /** Heaviest accounts, biggest first — who to look at when the bar goes red. */
   top:   { userId: string; bytes: number; overCeiling: boolean }[]
   /** Per-user ceiling in force, so the dashboard can show what "over" means. */
   ceiling: number
+  /** Where those bytes actually sit. */
+  breakdown: UsageBreakdown
 }
 
 export interface DiskSnapshot {
@@ -69,15 +85,31 @@ export function lichLogUsage(dataDir: string, topN = 5): LichLogUsage {
 
   const usersDir = join(dataDir, 'users')
   const rows: { userId: string; bytes: number; overCeiling: boolean }[] = []
+  const breakdown: UsageBreakdown = { lichLogs: 0, magiloomLogs: 0, lichMaps: 0, otherUser: 0 }
   let bytes = 0
 
   if (existsSync(usersDir)) {
     for (const id of safeList(usersDir)) {
+      const userDir = join(usersDir, id)
+      if (!isDir(userDir)) continue
       const home = userLichHome(dataDir, id)
-      if (!existsSync(lichLogsDir(home))) continue
-      const b = lichLogBytes(home)
-      bytes += b
-      rows.push({ userId: id, bytes: b, overCeiling: b > MAX_BYTES_PER_USER })
+
+      // Measure the whole user directory, then attribute the parts we know about.
+      // Deriving "other" by subtraction rather than walking it separately means the
+      // categories always sum to the real total — no silently unaccounted bytes.
+      const totalUser = dirBytes(userDir)
+      const lich = existsSync(lichLogsDir(home)) ? lichLogBytes(home) : 0
+      const mag  = dirBytes(join(userDir, 'logs'))
+      const maps = lichMapBytes(home)
+
+      breakdown.lichLogs     += lich
+      breakdown.magiloomLogs += mag
+      breakdown.lichMaps     += maps
+      breakdown.otherUser    += Math.max(0, totalUser - lich - mag - maps)
+
+      if (!totalUser) continue
+      bytes += totalUser
+      rows.push({ userId: id, bytes: totalUser, overCeiling: lich + mag > MAX_BYTES_PER_USER })
     }
   }
 
@@ -87,9 +119,51 @@ export function lichLogUsage(dataDir: string, topN = 5): LichLogUsage {
     users: rows.length,
     top: rows.slice(0, topN),
     ceiling: MAX_BYTES_PER_USER,
+    breakdown,
   }
   cache = { at: Date.now(), value }
   return value
+}
+
+/** Recursive byte total for a directory. Symlinks are NOT followed — each user's
+ *  Lich home symlinks the shared read-only library, and counting that per user would
+ *  inflate every account by the size of the engine. */
+function dirBytes(dir: string): number {
+  let total = 0
+  const stack = [dir]
+  while (stack.length) {
+    const d = stack.pop()!
+    let entries: import('fs').Dirent[]
+    try { entries = readdirSync(d, { withFileTypes: true }) } catch { continue }
+    for (const e of entries) {
+      const p = join(d, e.name)
+      if (e.isSymbolicLink()) continue
+      if (e.isDirectory()) { stack.push(p); continue }
+      try { total += statSync(p).size } catch { /* vanished mid-walk */ }
+    }
+  }
+  return total
+}
+
+/** Bytes held by Lich's prime-map downloads under <home>/data/<GAME>/. */
+function lichMapBytes(lichHome: string): number {
+  const dataDir = join(lichHome, 'data')
+  if (!existsSync(dataDir)) return 0
+  let total = 0
+  for (const game of safeList(dataDir)) {
+    if (!/^(?:DR|GS)[A-Z]?$/.test(game)) continue
+    const gameDir = join(dataDir, game)
+    if (!isDir(gameDir)) continue
+    for (const f of safeList(gameDir)) {
+      if (!/^map-\d+\.(?:json|dat|xml)(?:\.bak)?$/i.test(f)) continue
+      try { total += statSync(join(gameDir, f)).size } catch { /* skip */ }
+    }
+  }
+  return total
+}
+
+function isDir(p: string): boolean {
+  try { return statSync(p).isDirectory() } catch { return false }
 }
 
 /** Drop the cached walk — call after pruning so the dashboard reflects it at once. */

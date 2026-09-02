@@ -1,6 +1,7 @@
 import { join } from 'path'
 import { existsSync, readdirSync, rmdirSync, statSync, unlinkSync } from 'fs'
 import { listLichLogs, lichLogsDir, type LichLogEntry } from './lich-log-store'
+import { LogStore, eventName } from './log-store'
 import { userLichHome } from '../lich-home'
 
 // ── Lich session-log retention ──────────────────────────────────────────────────
@@ -144,27 +145,167 @@ export function pruneLichLogs(lichHome: string, opts: PruneOptions = {}): PruneR
 }
 
 /**
+ * Prune MAGILOOM's own game-output logs — DATA_DIR/users/<id>/logs/, one .log per
+ * character per day plus its .jsonl event sidecar.
+ *
+ * These are a separate grower from Lich's and were unbounded for longer: the first
+ * pass of this module only covered Lich, which made the admin gauge read reassuringly
+ * while our own logs sat inside "other used". Same age + ceiling policy applies.
+ *
+ * Deletion safety mirrors LogStore's own jail: candidates come from listFiles(),
+ * which only yields names matching `<charslug>-<YYYY-MM-DD>.log`, and the sidecar is
+ * derived from that validated name via eventName() rather than taken from anywhere.
+ */
+export function pruneMagiloomLogs(userDir: string, opts: PruneOptions = {}): PruneResult {
+  const dir = join(userDir, 'logs')
+  if (!existsSync(dir)) return { ...EMPTY }
+
+  const {
+    maxAgeDays = DEFAULT_RETENTION_DAYS,
+    maxBytes = MAX_BYTES_PER_USER,
+    dryRun = false,
+  } = opts
+
+  let files: ReturnType<LogStore['listFiles']>
+  try { files = new LogStore(userDir).listFiles() } catch { return { ...EMPTY } }
+  if (!files.length) return { ...EMPTY }
+
+  // A log and its sidecar are one session in two shapes — size and delete them as a
+  // unit, or the ceiling would count half the bytes and leave orphaned .jsonl behind.
+  const items = files.map(f => {
+    const names = [f.name]
+    let size = f.size
+    if (f.events) {
+      const ev = eventName(f.name)
+      names.push(ev)
+      try { size += statSync(join(dir, ev)).size } catch { /* sidecar vanished */ }
+    }
+    return { names, size, mtime: f.mtime }
+  })
+
+  const cutoff = Date.now() - clampRetentionDays(maxAgeDays) * 86_400_000
+  const doomed = new Set(items.filter(i => i.mtime < cutoff))
+
+  let hitByteCeiling = false
+  const survivors = items.filter(i => !doomed.has(i)).sort((a, b) => b.mtime - a.mtime)
+  let total = survivors.reduce((s, i) => s + i.size, 0)
+  if (total > maxBytes) {
+    hitByteCeiling = true
+    for (let i = survivors.length - 1; i >= 0 && total > maxBytes; i--) {
+      doomed.add(survivors[i]!)
+      total -= survivors[i]!.size
+    }
+  }
+
+  let removed = 0, bytes = 0
+  for (const item of doomed) {
+    if (dryRun) { removed += item.names.length; bytes += item.size; continue }
+    let gone = false
+    for (const n of item.names) {
+      try { unlinkSync(join(dir, n)); removed++; gone = true } catch { /* leave it */ }
+    }
+    if (gone) bytes += item.size
+  }
+
+  const startTotal = items.reduce((s, i) => s + i.size, 0)
+  return { removed, bytes, remaining: startTotal - bytes, hitByteCeiling }
+}
+
+/**
+ * Prune Lich's duplicated prime-map downloads — <home>/data/<GAME>/map-*.json.
+ *
+ * download-prime-map.lic keeps the newest map plus up to three older ones and writes
+ * .bak copies beside them, so a user's home carries four near-identical ~13 MB files
+ * where one would do (measured: 54 MB in data/DR alone). Only the NEWEST map per game
+ * is kept. This is safe to be aggressive about — the script re-downloads when it finds
+ * none, and the map is public shared data, not anything the user authored.
+ *
+ * Unlike the log pruners this is not age- or ceiling-driven: an old map is not worth
+ * keeping merely because the disk has room.
+ */
+export function pruneLichMapData(lichHome: string, opts: { dryRun?: boolean } = {}): PruneResult {
+  const dataDir = join(lichHome, 'data')
+  if (!existsSync(dataDir)) return { ...EMPTY }
+
+  let removed = 0, bytes = 0, remaining = 0
+  // Lich keys map data by game code (DR, GS) — a directory per game beside the
+  // per-character dirs, so match the code shape rather than listing blindly.
+  for (const game of safeList(dataDir)) {
+    if (!/^(?:DR|GS)[A-Z]?$/.test(game)) continue
+    const gameDir = join(dataDir, game)
+    if (!isDir(gameDir)) continue
+
+    const maps: { name: string; size: number; mtime: number }[] = []
+    for (const f of safeList(gameDir)) {
+      if (!/^map-\d+\.(?:json|dat|xml)(?:\.bak)?$/i.test(f)) continue
+      try {
+        const st = statSync(join(gameDir, f))
+        if (st.isFile()) maps.push({ name: f, size: st.size, mtime: st.mtimeMs })
+      } catch { /* skip */ }
+    }
+    if (maps.length < 2) { remaining += maps.reduce((s, m) => s + m.size, 0); continue }
+
+    // Newest first; keep [0]. A .bak is never the keeper — it's a copy of one of the
+    // others by construction — so sort it below a real map of the same age.
+    maps.sort((a, b) =>
+      (b.mtime - a.mtime) || (Number(a.name.endsWith('.bak')) - Number(b.name.endsWith('.bak'))))
+    const keep = maps.findIndex(m => !m.name.toLowerCase().endsWith('.bak'))
+    const keeper = keep >= 0 ? maps[keep]! : maps[0]!
+
+    for (const m of maps) {
+      if (m === keeper) { remaining += m.size; continue }
+      if (opts.dryRun) { removed++; bytes += m.size; continue }
+      try { unlinkSync(join(gameDir, m.name)); removed++; bytes += m.size }
+      catch { remaining += m.size }
+    }
+  }
+  return { removed, bytes, remaining, hitByteCeiling: false }
+}
+
+export interface PruneAllResult {
+  users: number
+  removed: number
+  bytes: number
+  /** Per-category bytes, so the caller can log where the space actually went. */
+  byKind: { lichLogs: number; magiloomLogs: number; lichMaps: number }
+}
+
+/**
  * Prune every user under DATA_DIR/users/. `retentionFor` lets the caller resolve
- * each user's own setting; users with no Lich home are skipped silently.
+ * each user's own setting; users with nothing to prune are skipped silently.
  */
 export function pruneAllUsers(
   dataDir: string,
   retentionFor: (userId: string) => number = () => DEFAULT_RETENTION_DAYS,
   opts: Omit<PruneOptions, 'maxAgeDays'> = {},
-): { users: number; removed: number; bytes: number } {
+): PruneAllResult {
   const usersDir = join(dataDir, 'users')
-  if (!existsSync(usersDir)) return { users: 0, removed: 0, bytes: 0 }
+  const byKind = { lichLogs: 0, magiloomLogs: 0, lichMaps: 0 }
+  if (!existsSync(usersDir)) return { users: 0, removed: 0, bytes: 0, byKind }
 
   let users = 0, removed = 0, bytes = 0
   for (const id of safeList(usersDir)) {
+    const userDir = join(usersDir, id)
+    if (!isDir(userDir)) continue
     const home = userLichHome(dataDir, id)
-    if (!existsSync(lichLogsDir(home))) continue
-    const r = pruneLichLogs(home, { ...opts, maxAgeDays: retentionFor(id) })
-    users++
-    removed += r.removed
-    bytes += r.bytes
+    const days = retentionFor(id)
+    let touched = false
+
+    for (const [kind, run] of [
+      ['lichLogs',     () => pruneLichLogs(home, { ...opts, maxAgeDays: days })],
+      ['magiloomLogs', () => pruneMagiloomLogs(userDir, { ...opts, maxAgeDays: days })],
+      ['lichMaps',     () => pruneLichMapData(home, { dryRun: opts.dryRun })],
+    ] as const) {
+      const r = run()
+      if (!r.removed) continue
+      touched = true
+      removed += r.removed
+      bytes += r.bytes
+      byKind[kind] += r.bytes
+    }
+    if (touched) users++
   }
-  return { users, removed, bytes }
+  return { users, removed, bytes, byKind }
 }
 
 /** Total bytes of Lich logs a user is holding — for the admin gauge and tests. */

@@ -366,9 +366,13 @@ function runLogPrune(): void {
       // The dashboard's log-size walk is cached for a minute; pruning invalidates it
       // so /admin doesn't keep reporting space that has already been reclaimed.
       invalidateDiskCache()
+      const mb = (n: number): string => (n / 1048576).toFixed(0)
+      // Break the total down by category — "2 GB reclaimed" doesn't say whether the
+      // policy that mattered was retention, the byte ceiling, or the map de-dup.
       // eslint-disable-next-line no-console
-      console.log(`[magiloom-server] pruned ${r.removed} Lich log(s), ` +
-        `${(r.bytes / 1048576).toFixed(0)} MB reclaimed across ${r.users} user(s)`)
+      console.log(`[magiloom-server] pruned ${r.removed} file(s), ${mb(r.bytes)} MB ` +
+        `reclaimed across ${r.users} user(s) — lich logs ${mb(r.byKind.lichLogs)} MB, ` +
+        `lantern logs ${mb(r.byKind.magiloomLogs)} MB, lich maps ${mb(r.byKind.lichMaps)} MB`)
     }
   } catch (err) {
     // Retention is housekeeping; a failure here must not stop the server booting.
