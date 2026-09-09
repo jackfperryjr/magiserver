@@ -8,7 +8,7 @@
     "build": "tsc -p tsconfig.json",
     "start": "node dist/index.js",
     "typecheck": "tsc --noEmit -p tsconfig.json",
-    "test": "tsx test-messaging.ts",
+    "test": "tsx test-messaging.ts && tsx test-lootify-cron.ts",
     "prune-logs": "node dist/prune-logs-cli.js",
     "prune-logs:dev": "tsx src/prune-logs-cli.ts",
     "vapid": "web-push generate-vapid-keys"

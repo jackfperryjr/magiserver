@@ -18,6 +18,7 @@ import { exportUserLichData } from './lib/user-export'
 import {
   initPush, isPushReady, vapidPublicKey, addSubscription, removeSubscription,
 } from './push'
+import { startLootifyCron, stopLootifyCron, lootifyStatus, triggerLootifyNow } from './lootify-cron'
 
 // ── Headless Magiloom server ────────────────────────────────────────────────────
 // The desktop app's src/main/index.ts, minus Electron. It hosts the game
@@ -64,6 +65,11 @@ const PRO_EMAILS = (process.env['MAGILOOM_PRO_EMAILS'] ?? '').split(',')
 const accounts = new AccountStore(DATA_DIR, PRO_EMAILS, ADMIN_EMAILS)
 
 initPush(DATA_DIR)
+
+// Daily workflow_dispatch to the lootify repo at 03:00 Central — this server's clock
+// is punctual in a way GitHub's schedule queue is not. Off unless
+// MAGILOOM_LOOTIFY_ENABLED=1 and a GitHub credential is set (see lootify-cron.ts).
+startLootifyCron(DATA_DIR)
 
 // ── CORS ────────────────────────────────────────────────────────────────────────
 // MAGILOOM_ALLOW_ORIGIN takes a COMMA-SEPARATED list, e.g.
@@ -157,7 +163,8 @@ const httpServer = createServer((req, res) => {
   // the admin allowlist; /admin/stats is the gated data feed (which DOES include
   // character names — for the operator's eyes only).
   if (url.pathname === '/admin' || url.pathname === '/admin/login' ||
-      url.pathname === '/admin/stats' || url.pathname === '/admin/prune') {
+      url.pathname === '/admin/stats' || url.pathname === '/admin/prune' ||
+      url.pathname === '/admin/lootify') {
     if (!ADMIN_ENABLED) { res.writeHead(404, cors); res.end(); return }
     const json = (code: number, body: unknown) => {
       res.writeHead(code, { 'Content-Type': 'application/json', ...cors }); res.end(JSON.stringify(body))
@@ -210,6 +217,15 @@ const httpServer = createServer((req, res) => {
       return
     }
 
+    // Fire the lootify dispatch now instead of waiting for tomorrow's 03:00 — the
+    // way to verify a newly configured App/PAT actually has Actions: write, since a
+    // credential that is wrong is otherwise only discovered by a missed morning.
+    if (url.pathname === '/admin/lootify' && req.method === 'POST') {
+      if (!authorized()) { json(401, { ok: false, error: 'Unauthorized' }); return }
+      triggerLootifyNow().then(r => json(r.ok ? 200 : 502, r))
+      return
+    }
+
     if (url.pathname === '/admin/stats' && req.method === 'GET') {
       if (!authorized()) { json(401, { ok: false, error: 'Unauthorized' }); return }
       const snap = gateway?.snapshot()
@@ -223,6 +239,9 @@ const httpServer = createServer((req, res) => {
         // Volume headroom + what Lich logs are costing. The log walk behind this is
         // cached (see disk-usage.ts) because /admin polls every few seconds.
         disk:           diskSnapshot(DATA_DIR),
+        // Whether the daily lootify dispatch is armed, when it last fired, and (with
+        // App auth) the rolling installation-token expiry.
+        lootify:        lootifyStatus(),
         ...snap,
       })
       return
@@ -443,6 +462,7 @@ pruneTimer.unref()
 
 function shutdown(): void {
   clearInterval(pruneTimer)
+  stopLootifyCron()
   users.dispose()
   map.dispose()
   httpServer.close()

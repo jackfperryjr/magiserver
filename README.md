@@ -82,6 +82,35 @@ DR's duplicate chunks.
 default to avoid double-firing while the renderer still evaluates them; flip
 `autoRunCommandTriggers` in `session.ts` once the thin client stops doing so.
 
+### Lootify daily trigger
+
+`lootify-cron.ts` fires a `workflow_dispatch` at the [lootify](https://github.com/jackfperryjr/lootify)
+repo at **03:00 America/Chicago**, because GitHub's own `schedule:` can't. Scheduled
+runs sit on a shared best-effort queue that GitHub deprioritises under load, so a
+06:00 cron routinely fired at 10:00; a workflow the run *starts late* can't correct
+for that from the inside. A dispatch through the REST API isn't queued that way, and
+this server is already awake with an accurate clock.
+
+DST is handled through `Intl` against the tz database (no dual-cron trick), the
+fired-today marker lives on the volume so a 02:58 redeploy triggers a catch-up rather
+than skipping the day, the wait is re-checked against the wall clock every minute so
+a suspended container can't sleep through it, and failed dispatches retry twice.
+`/admin` shows next/last dispatch and offers **Run now**. `test-lootify-cron.ts`
+asserts the clock arithmetic against real spring-forward/fall-back dates.
+
+Off unless `MAGILOOM_LOOTIFY_ENABLED=1` **and** a GitHub credential is set:
+
+| var | |
+|---|---|
+| `MAGILOOM_GITHUB_APP_ID` + `MAGILOOM_GITHUB_APP_KEY` | **Preferred.** A GitHub App's id and private key (PEM, or base64 of it). The key never expires and the server mints a fresh 1-hour installation token per call — the credential on the wire rotates itself, hourly, with nothing to diarise. Install the App on `lootify` with **Actions: read and write**; the installation id is discovered from the repo (override with `MAGILOOM_GITHUB_APP_INSTALLATION`). |
+| `MAGILOOM_GITHUB_TOKEN` | Fallback: a fine-grained PAT scoped to `lootify` with Actions: read+write. GitHub has no API to renew a PAT, so **this one cannot self-rotate** — it dies on its expiry date and the trigger silently stops. Fine for a first test; move to the App. |
+| `MAGILOOM_LOOTIFY_AT` / `_TZ` | Target time, default `03:00` / `America/Chicago`. |
+| `MAGILOOM_LOOTIFY_REPO` / `_WORKFLOW` / `_REF` | Default `jackfperryjr/lootify` / `lootify.yaml` / `main`. |
+| `MAGILOOM_LOOTIFY_CATCHUP_HOURS` | How late a boot-time catch-up is still worth making, default `6`. |
+
+The one failure this can't cover is *this server* being down across 03:00, which is
+why lootify keeps a single late backstop cron that no-ops if a run already succeeded.
+
 ### Per-user Lich homes & file editing
 
 Lich keeps per-character setup (`scripts/profiles/<Char>-setup.yaml`), personal

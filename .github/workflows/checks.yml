@@ -35,9 +35,11 @@ jobs:
       - name: Typecheck
         run: npm run typecheck
 
-      # Drives MessageHub end-to-end against mock sessions — presence, contact
-      # requests, delivery, the offline queue, and on-disk persistence. No framework;
-      # the script asserts in plain code and exits non-zero on failure.
+      # Two suites, no framework; each asserts in plain code and exits non-zero.
+      #  • messaging — MessageHub end-to-end against mock sessions: presence, contact
+      #    requests, delivery, the offline queue, on-disk persistence.
+      #  • lootify-cron — the DST-aware clock arithmetic behind the daily dispatch,
+      #    asserted against real spring-forward/fall-back dates.
       - name: Tests
         run: npm test
 
