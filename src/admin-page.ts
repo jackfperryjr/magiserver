@@ -99,11 +99,17 @@ export const ADMIN_HTML = `<!DOCTYPE html>
   /* The pruner also runs at boot and every 6h; this is for when you don't want to
      wait for either. It deletes, so it asks first. */
   .card-h{display:flex;align-items:center;gap:12px}
-  .prune-btn{margin-left:auto;background:none;border:1px solid var(--border-hi);border-radius:6px;color:var(--muted);padding:4px 10px;font:inherit;font-size:11px;text-transform:none;letter-spacing:0;cursor:pointer}
-  .prune-btn:hover{border-color:var(--accent);color:var(--accent)}
-  .prune-btn:disabled{opacity:.5;cursor:default}
+  .prune-btn,.act-btn{margin-left:auto;background:none;border:1px solid var(--border-hi);border-radius:6px;color:var(--muted);padding:4px 10px;font:inherit;font-size:11px;text-transform:none;letter-spacing:0;cursor:pointer}
+  .prune-btn:hover,.act-btn:hover{border-color:var(--accent);color:var(--accent)}
+  .prune-btn:disabled,.act-btn:disabled{opacity:.5;cursor:default}
   .prune-btn.confirm{border-color:var(--red);color:var(--red)}
   .prune-msg{font-size:11px;color:var(--dim);text-transform:none;letter-spacing:0;font-weight:400}
+  /* Daily lootify dispatch. Only the failure states are coloured — a green row for
+     "it worked" on a job that works every day is noise you stop reading. */
+  .loot-rows > div{display:flex;justify-content:space-between;gap:16px;padding:3px 0;font-size:12px;font-family:'JetBrains Mono',monospace;color:var(--muted)}
+  .loot-rows b{color:var(--bright);font-weight:600}
+  .loot-rows b.bad{color:var(--red)}
+  .loot-err{margin-top:10px;font-size:11px;font-family:'JetBrains Mono',monospace;color:var(--red);word-break:break-word}
   .foot{margin-top:20px;font-size:11px;color:var(--dim);font-family:'JetBrains Mono',monospace;display:flex;justify-content:space-between;flex-wrap:wrap;gap:10px}
   .foot a{color:var(--dim)}
   .signout{background:none;border:1px solid var(--border-hi);border-radius:6px;color:var(--muted);padding:4px 10px;font-size:11px;cursor:pointer}
@@ -169,6 +175,15 @@ export const ADMIN_HTML = `<!DOCTYPE html>
         <div id="d-top" class="disk-rows"></div>
       </div>
     </div>
+  </div>
+
+  <div class="card" id="loot-card" style="margin-bottom:24px;display:none">
+    <div class="card-h">Lootify · daily trigger
+      <button id="loot-btn" class="act-btn">Run now</button>
+      <span id="loot-msg" class="prune-msg"></span>
+    </div>
+    <div id="loot-rows" class="loot-rows"></div>
+    <div id="loot-err" class="loot-err"></div>
   </div>
 
   <div class="card">
@@ -277,6 +292,36 @@ export const ADMIN_HTML = `<!DOCTYPE html>
     }).join('');
   }
 
+  // The dispatch is the thing standing between a 03:00 reward claim and whenever
+  // GitHub's schedule queue would otherwise get round to it, so the card answers the
+  // two questions worth asking at a glance: is it still armed, and did this
+  // morning's actually go out.
+  function renderLootify(l){
+    var card = document.getElementById('loot-card');
+    if(!l || !l.enabled){ card.style.display='none'; return; }
+    card.style.display='block';
+    var now = Date.now();
+    var rows = [];
+    rows.push(['Target', l.at + ' ' + l.tz + ' → ' + l.repo + ' / ' + l.workflow, false]);
+    rows.push(['Next dispatch', l.armed && l.nextRun
+      ? new Date(l.nextRun).toLocaleString() + ' (in ' + fmtDur(l.nextRun - now) + ')'
+      : 'not armed', !l.armed]);
+    rows.push(['Last dispatch', l.lastFiredAt
+      ? fmtDur(now - l.lastFiredAt) + ' ago' + (l.lastFiredDay ? ' · for ' + l.lastFiredDay : '')
+      : 'never', l.lastResult === 'error']);
+    // A PAT can't renew itself, so name that trade-off here rather than in a doc the
+    // operator reads once — this is where they'll be looking the day it expires.
+    rows.push(['Credential', l.auth === 'app' ? 'GitHub App (rotates hourly)'
+      : l.auth === 'pat' ? 'fine-grained PAT (manual rotation)' : 'none', !l.auth]);
+    if(l.auth === 'app' && l.tokenExpiresAt)
+      rows.push(['Token renews', new Date(l.tokenExpiresAt).toLocaleTimeString(), false]);
+    document.getElementById('loot-rows').innerHTML = rows.map(function(r){
+      return '<div><span>'+esc(r[0])+'</span><b'+(r[2]?' class="bad"':'')+'>'+esc(r[1])+'</b></div>';
+    }).join('');
+    document.getElementById('loot-err').textContent =
+      l.lastResult === 'error' && l.lastError ? l.lastError : '';
+  }
+
   function render(d){
     document.getElementById('t-online').textContent = d.online;
     document.getElementById('t-playing').textContent = d.playing;
@@ -286,6 +331,7 @@ export const ADMIN_HTML = `<!DOCTYPE html>
     document.getElementById('t-uptime').textContent = fmtDur(d.uptimeSec*1000);
     document.getElementById('foot-push').textContent = 'push: ' + (d.push ? 'ready' : 'off');
     renderDisk(d.disk);
+    renderLootify(d.lootify);
     var st = document.getElementById('status');
     st.className='status'; st.innerHTML='live · <b>updated ' + new Date().toLocaleTimeString() + '</b>';
 
@@ -330,6 +376,20 @@ export const ADMIN_HTML = `<!DOCTYPE html>
         })
         .catch(function(){ msg.textContent = 'failed'; })
         .then(function(){ btn.disabled = false; btn.textContent = 'Prune now'; });
+    };
+  })();
+
+  // No confirm step here: an extra dispatch just claims the same rewards again,
+  // which the game treats as a no-op. Unlike the pruner, nothing is destroyed.
+  (function wireLootify(){
+    var btn = document.getElementById('loot-btn'), msg = document.getElementById('loot-msg');
+    btn.onclick = function(){
+      btn.disabled = true; btn.textContent = 'Dispatching…'; msg.textContent = '';
+      fetch('/admin/lootify', { method:'POST', headers:{ 'Authorization':'Bearer '+localStorage.getItem(TOKEN_LS) } })
+        .then(function(r){ return r.json(); })
+        .then(function(d){ msg.textContent = d.ok ? 'dispatched' : (d.error || 'failed'); poll(); })
+        .catch(function(){ msg.textContent = 'failed'; })
+        .then(function(){ btn.disabled = false; btn.textContent = 'Run now'; });
     };
   })();
 
