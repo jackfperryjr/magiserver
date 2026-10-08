@@ -1,6 +1,7 @@
 import { join } from 'path'
 import { LichManager, LichConnection } from './lib/lich-manager'
 import { GameConnection } from './lib/game-connection'
+import { CharGenConnection } from './lib/chargen'
 import { CmdScriptEngine } from './lib/cmd-script-engine'
 import { MapStore, type StoredZone } from './lib/map-store'
 import { LogStore, logSlug } from './lib/log-store'
@@ -47,6 +48,9 @@ export interface ServerContext {
  */
 export class Session {
   private readonly gameConn = new GameConnection()
+  // DragonRealms' character generator — its own socket, independent of gameConn
+  // (see lib/chargen.ts). Open only while a client sits on the creation screen.
+  private readonly charGen  = new CharGenConnection()
   private readonly lichConn = new LichConnection()
   private readonly lichMgr  = new LichManager()
   private readonly cmdEngine: CmdScriptEngine
@@ -149,6 +153,11 @@ export class Session {
 
     broadcast.on('command', (cmd: string) => this.emit('broadcast:incoming', cmd))
     map.on('zoneChanged',   (zone: StoredZone) => this.emit('map:zone-changed', zone))
+
+    this.charGen.on('connected', ()          => { this.lichLog('[chargen] Connected'); this.emit('chargen:connected') })
+    this.charGen.on('data',      (t: string) => this.emit('chargen:data', t))
+    this.charGen.on('error',     (e: string) => { this.lichLog('[chargen] Error: ' + e); this.emit('chargen:error', e) })
+    this.charGen.on('closed',    ()          => { this.lichLog('[chargen] Session closed'); this.emit('chargen:closed') })
 
     this.gameConn.on('log',          (l: string) => this.lichLog('[game] ' + l))
     this.gameConn.on('connected',    () => { this.lichLog('[game] Connected'); this.emit('game:connected'); this.syncPresence() })
@@ -369,6 +378,17 @@ export class Session {
       case 'auth:select-instance':  return this.selectInstance(a[0] as string)
       case 'auth:select-character': return this.selectCharacter(a[0] as string, a[1] as string, a[2] as string, a[3] as boolean | undefined)
 
+      // character creation (mirrors the desktop's chargen ipc handlers)
+      case 'chargen:start': return this.startCharGen()
+      case 'chargen:send':
+        // No generator behind this session — it ended, or the session was rebuilt
+        // after the client was away past the grace window. Say so, so the creation
+        // screen shows "ended" instead of swallowing commands.
+        if (!this.charGen.isOpen()) { this.emit('chargen:closed'); return }
+        this.charGen.send(String(a[0] ?? ''))
+        return
+      case 'chargen:stop': this.charGen.disconnect(); return
+
       // lich
       case 'lich:get-log':     return this.lichLogBuffer.slice()
       // On the server, Lich availability is the shared install, not a local path —
@@ -472,6 +492,9 @@ export class Session {
 
   // ── SGE auth flow (mirrors the three auth ipc handlers) ──────────────────────
   private async login(account: string, password: string): Promise<unknown> {
+    // A generator left open by a client that reloaded mid-creation has no screen
+    // attached to it any more; a fresh sign-in is where that gets cleaned up.
+    this.charGen.disconnect()
     const result = await sgeAuth(account, password, (l) => this.lichLog('[sge] ' + l))
     if (!result.ok) return result
     this.pendingSelectInstance = result.selectInstance
@@ -596,6 +619,34 @@ export class Session {
     return { ok: true }
   }
 
+  // ── Character creation ───────────────────────────────────────────────────────
+  // Launching slot "0" opens DragonRealms' character generator as its own game
+  // session (see lib/chargen.ts). It runs on the SGE session the login already
+  // established, so it must be started from the character list — the same place
+  // `L` would be sent for a real character. It never touches gameConn or Lich, so
+  // it is not a "game session" for presence, metrics, or the gateway's keepalive.
+  private async startCharGen(): Promise<unknown> {
+    const fetchKey = this.pendingSelectCharacter
+    if (!fetchKey) return { ok: false, error: 'Session expired — sign in again.' }
+    let key: SGELaunchKey
+    try {
+      key = await fetchKey('0')
+    } catch (e) {
+      const msg = String(e)
+      // The generator refuses accounts without an active subscription or trial.
+      return { ok: false, error: /PROBLEM/i.test(msg)
+        ? 'This account cannot create a character on this instance — an active subscription or trial is required.'
+        : msg }
+    }
+    // Consumed: the eaccess socket closes with the launch response either way.
+    this.pendingSelectCharacter = null
+    this.pendingSelectClose     = null
+    this.loginPassword          = null
+    this.lichLog('[chargen] Connecting to the character generator at ' + key.host + ':' + key.port)
+    this.charGen.connect(key.host, key.port, key.key)
+    return { ok: true }
+  }
+
   /** Ensure this user's writable Lich dirs exist and return their scripts dir. */
   private userScriptsDir(): string {
     return ensureUserScriptsDir(this.server.dataDir, this.user.userId)
@@ -696,6 +747,7 @@ export class Session {
    *  Called by the gateway once the last client is gone and grace/keepalive expires. */
   dispose(): void {
     this.loginPassword = null
+    this.charGen.disconnect()
     this.endSession()
   }
 }
