@@ -36,7 +36,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 #
 # A failed build does not take down the running deploy — Railway keeps the last good
 # one until a new build succeeds.
-RUN git clone --depth 1 --branch v5.21.0 https://github.com/elanthia-online/lich-5.git /opt/lich \
+RUN git clone --depth 1 --branch v5.22.0 https://github.com/elanthia-online/lich-5.git /opt/lich \
     && cd /opt/lich \
     && bundle lock --add-platform x86_64-linux \
     && bundle config set --local without 'development vscode profanity' \
