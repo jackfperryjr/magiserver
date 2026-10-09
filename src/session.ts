@@ -154,10 +154,10 @@ export class Session {
     broadcast.on('command', (cmd: string) => this.emit('broadcast:incoming', cmd))
     map.on('zoneChanged',   (zone: StoredZone) => this.emit('map:zone-changed', zone))
 
-    this.charGen.on('connected', ()          => { this.lichLog('[chargen] Connected'); this.emit('chargen:connected') })
+    this.charGen.on('connected', ()          => this.emit('chargen:connected'))
     this.charGen.on('data',      (t: string) => this.emit('chargen:data', t))
     this.charGen.on('error',     (e: string) => { this.lichLog('[chargen] Error: ' + e); this.emit('chargen:error', e) })
-    this.charGen.on('closed',    ()          => { this.lichLog('[chargen] Session closed'); this.emit('chargen:closed') })
+    this.charGen.on('closed',    ()          => this.emit('chargen:closed'))
 
     this.gameConn.on('log',          (l: string) => this.lichLog('[game] ' + l))
     this.gameConn.on('connected',    () => { this.lichLog('[game] Connected'); this.emit('game:connected'); this.syncPresence() })
@@ -642,7 +642,6 @@ export class Session {
     this.pendingSelectCharacter = null
     this.pendingSelectClose     = null
     this.loginPassword          = null
-    this.lichLog('[chargen] Connecting to the character generator at ' + key.host + ':' + key.port)
     this.charGen.connect(key.host, key.port, key.key)
     return { ok: true }
   }
