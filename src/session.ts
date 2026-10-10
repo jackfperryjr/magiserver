@@ -4,6 +4,7 @@ import { GameConnection } from './lib/game-connection'
 import { CharGenConnection } from './lib/chargen'
 import { CmdScriptEngine } from './lib/cmd-script-engine'
 import { MapStore, type StoredZone } from './lib/map-store'
+import type { HoldingsDoc, HoldingsPut } from './lib/holdings-store'
 import { LogStore, logSlug } from './lib/log-store'
 import { sgeAuth, type SGELaunchKey } from './lib/sge-auth'
 import {
@@ -152,6 +153,9 @@ export class Session {
     this.cmdEngine.on('error',  (msg: string)   => { this.lichLog('[script] ' + msg); this.emit('script:output', msg) })
 
     broadcast.on('command', (cmd: string) => this.emit('broadcast:incoming', cmd))
+    // A report filed by ANY of this user's sessions reaches all of them — that is how
+    // a character sees what another one, logged in elsewhere, has just recorded.
+    this.user.holdings.on('changed', this.onHoldingsChanged)
     map.on('zoneChanged',   (zone: StoredZone) => this.emit('map:zone-changed', zone))
 
     this.charGen.on('connected', ()          => this.emit('chargen:connected'))
@@ -198,6 +202,11 @@ export class Session {
   }
 
   /** Broadcast an event to EVERY attached client (multi-viewer / watch mode). */
+  // Held as a property so dispose() can remove exactly this listener: the store
+  // outlives the session (it is cached per user), and a dead session left subscribed
+  // would be kept alive by it and sent every change for good.
+  private readonly onHoldingsChanged = (doc: HoldingsDoc): void => this.emit('holdings:changed', doc)
+
   private emit(channel: string, ...args: unknown[]): void {
     for (const c of this.clients) c(channel, ...args)
   }
@@ -476,6 +485,15 @@ export class Session {
       // zone. One client clearing a zone would erase geography for every other
       // player, which is what map:delete-zone used to do. Both it and map:clear are
       // refused remotely; a zone can still be corrected room-by-room via save-zone.
+      // Account inventory. Belongs to the signed-in Magiloom account (this.user), so
+      // any character of that account reads what any other filed. The game account
+      // and character are taken from the client: they only decide where WITHIN this
+      // user's own file a report sits, so a wrong value can mislabel the user's own
+      // data and nothing else. Contents are bounded and cleaned in the store.
+      case 'holdings:get':    return this.user.holdings.get()
+      case 'holdings:put':    return this.user.holdings.put(a[0] as HoldingsPut)
+      case 'holdings:remove': return this.user.holdings.remove(String(a[0] ?? ''), a[1] == null ? undefined : String(a[1]))
+
       case 'map:load':        return this.server.map.loadAll()
       case 'map:save-zone':
         if (!this.charName) throw new Error('Connect a character before editing the map.')
@@ -745,6 +763,7 @@ export class Session {
   /** Tear down per-session resources (mirrors window-all-closed for one window).
    *  Called by the gateway once the last client is gone and grace/keepalive expires. */
   dispose(): void {
+    this.user.holdings.off('changed', this.onHoldingsChanged)
     this.loginPassword = null
     this.charGen.disconnect()
     this.endSession()
