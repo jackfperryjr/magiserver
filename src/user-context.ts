@@ -1,6 +1,7 @@
 import { join } from 'path'
 import { SettingsStore } from './lib/settings-store'
 import { BroadcastBus } from './lib/broadcast-bus'
+import { HoldingsStore } from './lib/holdings-store'
 
 // ── Per-user data isolation ─────────────────────────────────────────────────────
 // The desktop app kept ONE settings.json for a single person (holding several
@@ -21,6 +22,8 @@ export interface UserContext {
   dir:       string
   settings:  SettingsStore
   broadcast: BroadcastBus
+  /** Account inventory: every character's last INVENTORY LIST / VAULT report. */
+  holdings:  HoldingsStore
 }
 
 export class UserRegistry {
@@ -48,7 +51,10 @@ export class UserRegistry {
       // other's writes and one character's toggle silently flip the other's. Each
       // Session owns a LogStore pointed at this same `dir`, so the files still land
       // in one per-user logs/ directory.
-      ctx = { userId: id, dir, settings, broadcast: new BroadcastBus(dir) }
+      // The account inventory is per USER on purpose, and shared by every session
+      // that user has: it is the one thing here meant to be read from a different
+      // character than the one that wrote it.
+      ctx = { userId: id, dir, settings, broadcast: new BroadcastBus(dir), holdings: new HoldingsStore(dir) }
       this.cache.set(id, ctx)
     }
     return ctx
