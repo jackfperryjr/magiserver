@@ -12,8 +12,9 @@ name: Lich update check
 # merge-window workflow picks it up only after you approve it.
 on:
   schedule:
-    # Mondays 06:00 UTC. Lich releases land every few weeks, so weekly is plenty.
-    - cron: "0 6 * * 1"
+    # Nightly 06:00 UTC, an hour before merge-window.yml (07:07), so a release
+    # found tonight can merge tonight once the PR is approved.
+    - cron: "0 6 * * *"
   workflow_dispatch:
 
 permissions:
