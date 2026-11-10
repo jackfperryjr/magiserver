@@ -42,6 +42,12 @@ RUN git clone --depth 1 --branch v5.24.0 https://github.com/elanthia-online/lich
     && bundle config set --local without 'development vscode profanity' \
     && bundle install
 ENV MAGILOOM_LICH_SHARED=/opt/lich
+# Lich runs with --home=<per-user dir>, which makes LICH_DIR the user's home, and its
+# startup gem check looks for the Gemfile at LICH_DIR/Gemfile. There is none there,
+# so without this Bundler searches from /app, finds nothing, and since 5.24.0 Lich
+# exits 1 ("could not read required gem declarations") instead of carrying on as
+# 5.23 did. BUNDLE_GEMFILE is the first thing that check honours.
+ENV BUNDLE_GEMFILE=/opt/lich/Gemfile
 
 # Want the ~237-script DR community library baked in too? Uncomment:
 # RUN git clone --depth 1 https://github.com/elanthia-online/dr-scripts.git /tmp/dr \
