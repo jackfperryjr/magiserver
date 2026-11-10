@@ -22,6 +22,10 @@ import { effectiveLimits, resolveRetentionDays, graceRemainingMs, type TierInfo,
 import type { AccountStore } from './accounts'
 import { listFiles, readFile, writeFile, deleteFile } from './lich-files'
 import { notify } from './push'
+import { checkLichUpdate } from './lib/lich-version'
+
+// Open Lich version-bump PRs (opened nightly by lich-update-check.yml).
+const LICH_UPDATE_PRS = 'https://github.com/jackfperryjr/magiserver/pulls?q=is%3Apr+is%3Aopen+label%3Alich-update'
 
 /** Sends an event to the connected client (replaces mainWindow.webContents.send). */
 export type Emit = (channel: string, ...args: unknown[]) => void
@@ -403,6 +407,14 @@ export class Session {
       // On the server, Lich availability is the shared install, not a local path —
       // report its lich.rbw so the client's "Connect with Lich" toggle knows.
       case 'lich:detect-path': { const r = sharedLichRoot(); return r ? join(r, 'lich.rbw') : '' }
+      // Lich update banner on the login screen — admins only. Players can't update the
+      // shared install; it moves with the Dockerfile pin, so point at the bump PR.
+      case 'lich:update-info': {
+        const r = sharedLichRoot()
+        if (!r || !this.isAdmin()) return null
+        const info = await checkLichUpdate(join(r, 'lich.rbw'))
+        return info && { ...info, managed: { prsUrl: LICH_UPDATE_PRS } }
+      }
       case 'lich:stop':        this.stopLich(); return
       case 'lich:launch-sidecar':
         return { ok: false, error: 'Use the Lich path in Settings to enable Lich at login.' }
@@ -673,6 +685,12 @@ export class Session {
    *  the user id (never from request arguments), so no call can reach another's. */
   private lichHomeDir(): string {
     return userLichHome(this.server.dataDir, this.user.userId)
+  }
+
+  /** Is the signed-in Magiloom account on the MAGILOOM_ADMIN_EMAILS allowlist? */
+  private isAdmin(): boolean {
+    const id = /^acct-(.+)$/.exec(this.user.userId)?.[1]
+    return !!(id && this.server.accounts?.getAccount(id)?.admin)
   }
 
   /** This account's storage plan, resolved the same way the pruner resolves it —
