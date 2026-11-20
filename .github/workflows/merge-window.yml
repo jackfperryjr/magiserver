@@ -1,23 +1,28 @@
 name: Merge window
 
-# Squash-merges approved Lich bumps overnight, so the Railway rebuild + restart
-# lands when nobody is connected.
+# Squash-merges one Lich bump PR, at the time magiserver announced to players.
 #
-# This does NOT loosen the rule that magiserver changes are merged deliberately:
-# a PR is only touched here if YOU have already approved it. The workflow chooses
-# the hour, not the outcome. Anything unapproved sits until you look at it.
+# There is deliberately NO schedule here. magiserver (src/lich-update-cron.ts)
+# dispatches this at the 03:00 America/Chicago slot shown in the web app's restart
+# banner, passing the PR number and the head commit the banner was announced for.
+# GitHub's own cron runs hours late under load, and a restart at an hour nobody was
+# told about is the one outcome this whole setup exists to prevent — so a missed
+# night just waits for the next announced slot rather than having a backstop here.
 #
-# Scope is the `lich-update` label alone. Label any other PR with it to send it
-# through the same window.
+# Railway deploys on merge to main, so merge time is restart time.
+#
+# Run it by hand (Actions → Merge window → Run workflow) to merge a bump right now;
+# the same guards apply.
 on:
-  schedule:
-    # 07:07 UTC daily — ~03:07 ET in summer, ~02:07 in winter (Actions cron is
-    # UTC-only, so the local hour drifts with DST). The odd minute is deliberate:
-    # runs on the hour queue behind everyone else's. Scheduled runs can be delayed
-    # or skipped entirely under load, so treat this as "some time tonight", not a
-    # deadline — an unmerged PR just waits for tomorrow's run.
-    - cron: "7 7 * * *"
   workflow_dispatch:
+    inputs:
+      pr:
+        description: "PR number of the lich-update PR to merge"
+        required: true
+      sha:
+        description: "Head commit it was announced for (blank = whatever is there now)"
+        required: false
+        default: ""
 
 permissions:
   contents: write
@@ -28,67 +33,46 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Merge approved lich-update PRs
+      - name: Merge the lich-update PR
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
+          PR: ${{ inputs.pr }}
+          SHA: ${{ inputs.sha }}
         run: |
           set -euo pipefail
 
-          prs=$(gh pr list --state open --label lich-update \
-                  --json number,title,isDraft,mergeable,reviewDecision,statusCheckRollup)
+          pr=$(gh pr view "$PR" \
+                 --json number,title,state,isDraft,mergeable,labels,headRefOid,statusCheckRollup)
+          echo "── #$(echo "$pr" | jq -r .number) $(echo "$pr" | jq -r .title)"
 
-          count=$(echo "$prs" | jq 'length')
-          if [ "$count" = "0" ]; then
-            echo "No open lich-update PRs."
-            exit 0
+          skip() { echo "::warning::not merging #$PR: $1"; exit 0; }
+
+          [ "$(echo "$pr" | jq -r .state)" = "OPEN" ] || skip "not open"
+          [ "$(echo "$pr" | jq -r .isDraft)" = "false" ] || skip "draft"
+          echo "$pr" | jq -e '[.labels[].name] | index("lich-update")' >/dev/null || skip "no lich-update label"
+          # The hold may have landed after the server's last look — it still wins.
+          if echo "$pr" | jq -e '[.labels[].name] | index("hold")' >/dev/null; then skip "on hold"; fi
+
+          head=$(echo "$pr" | jq -r .headRefOid)
+          if [ -n "$SHA" ] && [ "$SHA" != "$head" ]; then
+            skip "head moved ($head, announced $SHA) — the server will reschedule"
           fi
 
-          echo "$prs" | jq -c '.[]' | while read -r pr; do
-            num=$(echo "$pr" | jq -r '.number')
-            title=$(echo "$pr" | jq -r '.title')
-            echo "── #$num $title"
+          mergeable=$(echo "$pr" | jq -r .mergeable)
+          [ "$mergeable" = "MERGEABLE" ] || skip "not mergeable ($mergeable)"
 
-            if [ "$(echo "$pr" | jq -r '.isDraft')" = "true" ]; then
-              echo "   skip: draft"; continue
-            fi
+          # Check runs expose status/conclusion; commit statuses expose state.
+          # Anything still running or not green blocks. Bot-opened PRs usually carry
+          # no checks at all (see lich-update-check.yml) — their gate was the smoke
+          # test that ran before the PR was opened.
+          pending=$(echo "$pr" | jq '[.statusCheckRollup[]?
+            | select(.__typename == "CheckRun" and .status != "COMPLETED")] | length')
+          [ "$pending" = "0" ] || skip "$pending check(s) still running"
+          failing=$(echo "$pr" | jq -r '[.statusCheckRollup[]?
+            | (.conclusion // .state // "")
+            | select(. != "SUCCESS" and . != "NEUTRAL" and . != "SKIPPED")] | length')
+          [ "$failing" = "0" ] || skip "$failing check(s) not green"
 
-            # The gate. GitHub reports APPROVED only when the latest review from a
-            # reviewer with write access is an approval and no change request is
-            # outstanding, which is exactly the condition we want.
-            decision=$(echo "$pr" | jq -r '.reviewDecision // "NONE"')
-            if [ "$decision" != "APPROVED" ]; then
-              echo "   skip: not approved (reviewDecision=$decision)"; continue
-            fi
-
-            mergeable=$(echo "$pr" | jq -r '.mergeable')
-            if [ "$mergeable" != "MERGEABLE" ]; then
-              echo "   skip: not mergeable ($mergeable)"; continue
-            fi
-
-            # Check runs expose status/conclusion; commit statuses expose state.
-            # Anything still running blocks; anything not green blocks.
-            pending=$(echo "$pr" | jq '[.statusCheckRollup[]?
-              | select(.__typename == "CheckRun" and .status != "COMPLETED")] | length')
-            if [ "$pending" != "0" ]; then
-              echo "   skip: $pending check(s) still running"; continue
-            fi
-
-            failing=$(echo "$pr" | jq -r '[.statusCheckRollup[]?
-              | (.conclusion // .state // "")
-              | select(. != "SUCCESS" and . != "NEUTRAL" and . != "SKIPPED")] | length')
-            if [ "$failing" != "0" ]; then
-              echo "   skip: $failing check(s) not green"; continue
-            fi
-
-            # Bot-opened PRs carry no checks at all (the default GITHUB_TOKEN does
-            # not trigger `pull_request` workflows). Loud, not fatal — your approval
-            # is the real gate here, and Checks does not build the image anyway.
-            total=$(echo "$pr" | jq '[.statusCheckRollup[]?] | length')
-            if [ "$total" = "0" ]; then
-              echo "   note: no checks reported on this PR — merging on approval alone"
-            fi
-
-            echo "   merging"
-            gh pr merge "$num" --squash --delete-branch
-          done
+          echo "merging @ ${head:0:7}"
+          gh pr merge "$PR" --squash --delete-branch --match-head-commit "$head"

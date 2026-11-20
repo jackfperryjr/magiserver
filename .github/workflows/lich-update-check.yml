@@ -8,14 +8,18 @@ name: Lich update check
 # per-user --home. So the only way to move Lich is to change that tag and redeploy,
 # and the only thing worth automating is noticing that a new tag exists.
 #
-# This job never merges anything. It opens a PR labelled `lich-update`; the
-# merge-window workflow picks it up only after you approve it.
+# This job never merges anything. It opens a PR labelled `lich-update`, and only
+# after the new tag has built and Lich has started in the image (the smoke test
+# below). magiserver then announces a merge time to players and dispatches
+# merge-window.yml at it — see src/lich-update-cron.ts.
 on:
-  schedule:
-    # Nightly 06:00 UTC, an hour before merge-window.yml (07:07), so a release
-    # found tonight can merge tonight once the PR is approved.
-    - cron: "0 6 * * *"
+  # The real trigger: magiserver dispatches this at 10:00 America/Chicago, on time.
   workflow_dispatch:
+  schedule:
+    # Backstop only, for a day the server was down at 10:00. GitHub runs these
+    # late, which is harmless here: opening a PR just starts the server's notice
+    # period, and a re-run with no new release changes nothing.
+    - cron: "0 20 * * *"
 
 permissions:
   contents: write
@@ -66,10 +70,9 @@ jobs:
             echo "one-token change to the \`git clone --branch\` in the Dockerfile — the"
             echo "surrounding notes are hand-maintained and untouched."
             echo
-            echo "**Read the notes before approving.** Anything touching DR stream"
-            echo "output, room-id placement, or EAccess/SGE login can move behaviour"
-            echo "the gateway depends on, and none of that is covered by CI (the"
-            echo "Checks workflow does not build the image)."
+            echo "The image built and Lich started under this server's layout (smoke"
+            echo "test in the check workflow). That does not cover DR stream output,"
+            echo "room-id placement or SGE login — skim the notes for those."
             echo
             echo "---"
             echo
@@ -79,8 +82,46 @@ jobs:
             echo
             echo "Full notes: https://github.com/elanthia-online/lich-5/releases/tag/$latest"
             echo
-            echo "Approve to hand this to the nightly merge window, or merge it yourself."
+            echo "**This merges automatically** at the next 03:00 Central at least six"
+            echo "hours away; players see a countdown banner until then. Add the \`hold\`"
+            echo "label (or press Hold in the banner / on /admin) to stop it, close the"
+            echo "PR to drop it, or merge it yourself any time."
           } > /tmp/pr-body.md
+
+      # The gate that replaces reading the notes before approving. 5.24.0 shipped a
+      # startup check that exited 1 under this server's --home layout and took every
+      # Lich session down; nothing caught it because nothing ever launched Lich
+      # before the merge. This builds the real image with the bumped tag and starts
+      # Lich the way lich-manager.ts does (xvfb-run, per-user --home, a detachable
+      # port), with no game to talk to. Pass = it opens its port, or is still up
+      # after 45s; fail = it exits. A failure here opens no PR, so nothing is
+      # scheduled, and GitHub emails the failed run.
+      - name: Smoke-test the bumped image
+        if: steps.lich.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          docker build -t lich-smoke .
+          docker run --rm lich-smoke bash -c '
+            home=$(mktemp -d)
+            xvfb-run -a ruby /opt/lich/lich.rbw --dragonrealms --frostbite -g 127.0.0.1:4901 --home="$home" --detachable-client=11998 > /tmp/lich.log 2>&1 &
+            pid=$!
+            for i in $(seq 1 45); do
+              if ! kill -0 "$pid" 2>/dev/null; then
+                code=0; wait "$pid" || code=$?
+                echo "::error::Lich exited during startup (code $code)"
+                cat /tmp/lich.log; exit 1
+              fi
+              for port in 11998 11024; do
+                if (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null; then
+                  echo "Lich is up and listening on $port after ${i}s"
+                  cat /tmp/lich.log; kill "$pid" 2>/dev/null || true; exit 0
+                fi
+              done
+              sleep 1
+            done
+            echo "Lich still running after 45s (no port seen) — counting as started"
+            cat /tmp/lich.log; kill "$pid" 2>/dev/null || true
+          '
 
       # Idempotent — the label has to exist before a PR can carry it, and the
       # merge-window workflow keys off it.
@@ -91,17 +132,16 @@ jobs:
         run: |
           gh label create lich-update \
             --color 1f6feb \
-            --description "Lich engine bump; eligible for the nightly merge window" \
+            --description "Lich engine bump; merges itself at the announced 03:00 slot" \
             --force
 
       # Reuses one branch, so a release landing while an earlier bump is still open
       # updates that PR instead of stacking a second one.
       #
       # NOTE: a PR opened with the default GITHUB_TOKEN does not trigger `pull_request`
-      # workflows, so Checks will not run here on its own. That is tolerable for a
-      # Dockerfile-tag change (Checks typechecks/tests/builds the gateway, none of
-      # which this touches) but it does mean the merge window has no green tick to
-      # gate on. Set a LICH_PR_TOKEN secret (a PAT with repo scope) to get CI back.
+      # workflows, so Checks does not run on it. That is fine: the smoke test above
+      # already built this exact image (which includes the gateway build) before the
+      # PR existed. LICH_PR_TOKEN, if set, is still preferred and brings Checks back.
       - name: Open the bump PR
         if: steps.lich.outputs.changed == 'true'
         uses: peter-evans/create-pull-request@v8
