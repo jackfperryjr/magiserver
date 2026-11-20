@@ -19,6 +19,10 @@ import {
   initPush, isPushReady, vapidPublicKey, addSubscription, removeSubscription,
 } from './push'
 import { startLootifyCron, stopLootifyCron, lootifyStatus, triggerLootifyNow } from './lootify-cron'
+import {
+  startLichUpdateCron, stopLichUpdateCron, lichUpdateStatus, maintenanceNotice,
+  setLichUpdateHold, triggerLichCheckNow,
+} from './lich-update-cron'
 
 // ── Headless Magiloom server ────────────────────────────────────────────────────
 // The desktop app's src/main/index.ts, minus Electron. It hosts the game
@@ -70,6 +74,20 @@ initPush(DATA_DIR)
 // is punctual in a way GitHub's schedule queue is not. Off unless
 // MAGILOOM_LOOTIFY_ENABLED=1 and a GitHub credential is set (see lootify-cron.ts).
 startLootifyCron(DATA_DIR)
+
+// Lich bumps: release check at 10:00 Central, merge (= redeploy = restart) at the
+// next 03:00 at least six hours on, announced to clients via /maintenance. Off unless
+// MAGILOOM_LICH_UPDATE_ENABLED=1 and the GitHub App can reach this repo.
+startLichUpdateCron(DATA_DIR)
+
+/** An admin-allowlisted account token, or the break-glass admin token. */
+function isAdminBearer(req: import('http').IncomingMessage): boolean {
+  const provided = (req.headers['authorization'] ?? '').replace(/^Bearer\s+/i, '')
+  if (!provided) return false
+  if (ADMIN_TOKEN && safeEq(provided, ADMIN_TOKEN)) return true
+  const acct = accounts.accountForToken(provided)
+  return !!acct && acct.admin
+}
 
 // ── CORS ────────────────────────────────────────────────────────────────────────
 // MAGILOOM_ALLOW_ORIGIN takes a COMMA-SEPARATED list, e.g.
@@ -158,13 +176,36 @@ const httpServer = createServer((req, res) => {
     return
   }
 
+  // ── Scheduled maintenance (the web app's restart banner) ───────────────────────
+  // Public: a pending Lich update restarts the server, and every player should see
+  // when. Signed in as an admin the answer also covers a HELD update (so the banner
+  // can offer Resume) and says the caller may hold it.
+  if (url.pathname === '/maintenance' && req.method === 'GET') {
+    const admin = isAdminBearer(req)
+    res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store', ...cors })
+    res.end(JSON.stringify({ ok: true, now: Date.now(), notice: maintenanceNotice(admin), canHold: admin }))
+    return
+  }
+  // Body: { hold: boolean }. Toggles the `hold` label on the bump PR.
+  if (url.pathname === '/maintenance/hold' && req.method === 'POST') {
+    const json = (code: number, body: unknown) => {
+      res.writeHead(code, { 'Content-Type': 'application/json', ...cors }); res.end(JSON.stringify(body))
+    }
+    if (!isAdminBearer(req)) { json(401, { ok: false, error: 'Unauthorized' }); return }
+    readJson(req)
+      .then(b => setLichUpdateHold((b as { hold?: unknown }).hold === true))
+      .then(r => json(r.ok ? 200 : 409, r))
+      .catch(() => json(400, { ok: false, error: 'Bad request.' }))
+    return
+  }
+
   // ── Admin metrics dashboard (off unless a gate is configured — see ADMIN_ENABLED) ─
   // /admin serves the viewer page; /admin/login authenticates a Magiloom account on
   // the admin allowlist; /admin/stats is the gated data feed (which DOES include
   // character names — for the operator's eyes only).
   if (url.pathname === '/admin' || url.pathname === '/admin/login' ||
       url.pathname === '/admin/stats' || url.pathname === '/admin/prune' ||
-      url.pathname === '/admin/lootify') {
+      url.pathname === '/admin/lootify' || url.pathname === '/admin/lich-check') {
     if (!ADMIN_ENABLED) { res.writeHead(404, cors); res.end(); return }
     const json = (code: number, body: unknown) => {
       res.writeHead(code, { 'Content-Type': 'application/json', ...cors }); res.end(JSON.stringify(body))
@@ -226,6 +267,13 @@ const httpServer = createServer((req, res) => {
       return
     }
 
+    // Run the Lich release check now instead of at 10:00.
+    if (url.pathname === '/admin/lich-check' && req.method === 'POST') {
+      if (!authorized()) { json(401, { ok: false, error: 'Unauthorized' }); return }
+      triggerLichCheckNow().then(r => json(r.ok ? 200 : 502, r))
+      return
+    }
+
     if (url.pathname === '/admin/stats' && req.method === 'GET') {
       if (!authorized()) { json(401, { ok: false, error: 'Unauthorized' }); return }
       const snap = gateway?.snapshot()
@@ -242,6 +290,8 @@ const httpServer = createServer((req, res) => {
         // Whether the daily lootify dispatch is armed, when it last fired, and (with
         // App auth) the rolling installation-token expiry.
         lootify:        lootifyStatus(),
+        // The Lich bump schedule: pending PR + merge time, last check/merge dispatch.
+        lichUpdate:     lichUpdateStatus(),
         ...snap,
       })
       return
@@ -463,6 +513,7 @@ pruneTimer.unref()
 function shutdown(): void {
   clearInterval(pruneTimer)
   stopLootifyCron()
+  stopLichUpdateCron()
   users.dispose()
   map.dispose()
   httpServer.close()

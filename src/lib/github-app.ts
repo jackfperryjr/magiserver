@@ -151,6 +151,7 @@ export function resolveGitHubAuth(repo: string): GitHubAuth | null {
  *  verbatim rather than as "dispatch failed". */
 export async function dispatchWorkflow(
   auth: GitHubAuth, repo: string, workflow: string, ref: string,
+  inputs?: Record<string, string>,
 ): Promise<void> {
   const res = await fetch(`${API}/repos/${repo}/actions/workflows/${encodeURIComponent(workflow)}/dispatches`, {
     method: 'POST',
@@ -161,8 +162,29 @@ export async function dispatchWorkflow(
       'content-type': 'application/json',
       'user-agent': 'magiloom-server',
     },
-    body: JSON.stringify({ ref }),
+    body: JSON.stringify(inputs ? { ref, inputs } : { ref }),
   })
   if (res.status === 204) return
   throw new Error(`dispatch ${repo}/${workflow} -> ${res.status} ${(await res.text()).slice(0, 200)}`)
+}
+
+/** A REST call to the GitHub API with the given credential. Returns the parsed JSON
+ *  (null for an empty 204), throws with the API's own message on any non-2xx. */
+export async function githubRequest(
+  auth: GitHubAuth, method: 'GET' | 'POST' | 'DELETE', path: string, body?: unknown,
+): Promise<unknown> {
+  const res = await fetch(`${API}${path}`, {
+    method,
+    headers: {
+      accept: 'application/vnd.github+json',
+      authorization: `Bearer ${await auth.token()}`,
+      'x-github-api-version': '2022-11-28',
+      'user-agent': 'magiloom-server',
+      ...(body !== undefined ? { 'content-type': 'application/json' } : {}),
+    },
+    ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
+  })
+  const text = await res.text()
+  if (!res.ok) throw new Error(`GitHub ${method} ${path} -> ${res.status} ${text.slice(0, 200)}`)
+  return text ? JSON.parse(text) as unknown : null
 }

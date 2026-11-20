@@ -186,6 +186,16 @@ export const ADMIN_HTML = `<!DOCTYPE html>
     <div id="loot-err" class="loot-err"></div>
   </div>
 
+  <div class="card" id="lu-card" style="margin-bottom:24px;display:none">
+    <div class="card-h">Lich updates · scheduled merge
+      <button id="lu-hold" class="act-btn" style="display:none"></button>
+      <button id="lu-btn" class="act-btn">Check now</button>
+      <span id="lu-msg" class="prune-msg"></span>
+    </div>
+    <div id="lu-rows" class="loot-rows"></div>
+    <div id="lu-err" class="loot-err"></div>
+  </div>
+
   <div class="card">
     <div class="card-h">Sessions</div>
     <table>
@@ -322,6 +332,36 @@ export const ADMIN_HTML = `<!DOCTYPE html>
       l.lastResult === 'error' && l.lastError ? l.lastError : '';
   }
 
+  function renderLichUpdate(u){
+    var card = document.getElementById('lu-card');
+    if(!u || !u.enabled){ card.style.display='none'; return; }
+    card.style.display='block';
+    var now = Date.now(), p = u.pending, rows = [];
+    rows.push(['Schedule', 'check ' + u.checkAt + ' · merge ' + u.mergeAt + ' ' + u.tz, false]);
+    rows.push(['Next check', u.armed && u.nextCheck
+      ? new Date(u.nextCheck).toLocaleString() + ' (in ' + fmtDur(u.nextCheck - now) + ')' : 'not armed', !u.armed]);
+    if(p){
+      rows.push(['Pending', '#' + p.pr + ' ' + p.title, false]);
+      rows.push(['Merge', p.phase === 'held' ? 'on hold'
+        : p.phase === 'merging' ? 'merging — restart pending'
+        : new Date(p.mergeAt).toLocaleString() + ' (in ' + fmtDur(p.mergeAt - now) + ')', p.phase === 'held']);
+    } else {
+      rows.push(['Pending', 'none', false]);
+    }
+    if(u.lastCheck) rows.push(['Last check', fmtDur(now - u.lastCheck.at) + ' ago', !u.lastCheck.ok]);
+    if(u.lastMerge) rows.push(['Last merge', '#' + u.lastMerge.pr + ' · ' + fmtDur(now - u.lastMerge.at) + ' ago', !u.lastMerge.ok]);
+    document.getElementById('lu-rows').innerHTML = rows.map(function(r){
+      return '<div><span>'+esc(r[0])+'</span><b'+(r[2]?' class="bad"':'')+'>'+esc(r[1])+'</b></div>';
+    }).join('');
+    var errs = [u.lastPoll, u.lastCheck, u.lastMerge].filter(function(o){ return o && !o.ok && o.error; });
+    document.getElementById('lu-err').textContent = errs.length ? errs[0].error : '';
+    var hold = document.getElementById('lu-hold');
+    var holdable = p && p.phase !== 'merging';
+    hold.style.display = holdable ? '' : 'none';
+    hold.dataset.hold = holdable && p.phase === 'held' ? '0' : '1';
+    if(!hold.disabled) hold.textContent = hold.dataset.hold === '1' ? 'Hold' : 'Resume';
+  }
+
   function render(d){
     document.getElementById('t-online').textContent = d.online;
     document.getElementById('t-playing').textContent = d.playing;
@@ -332,6 +372,7 @@ export const ADMIN_HTML = `<!DOCTYPE html>
     document.getElementById('foot-push').textContent = 'push: ' + (d.push ? 'ready' : 'off');
     renderDisk(d.disk);
     renderLootify(d.lootify);
+    renderLichUpdate(d.lichUpdate);
     var st = document.getElementById('status');
     st.className='status'; st.innerHTML='live · <b>updated ' + new Date().toLocaleTimeString() + '</b>';
 
@@ -390,6 +431,28 @@ export const ADMIN_HTML = `<!DOCTYPE html>
         .then(function(d){ msg.textContent = d.ok ? 'dispatched' : (d.error || 'failed'); poll(); })
         .catch(function(){ msg.textContent = 'failed'; })
         .then(function(){ btn.disabled = false; btn.textContent = 'Run now'; });
+    };
+  })();
+
+  (function wireLichUpdate(){
+    var btn = document.getElementById('lu-btn'), hold = document.getElementById('lu-hold'), msg = document.getElementById('lu-msg');
+    var auth = function(){ return { 'Authorization':'Bearer '+localStorage.getItem(TOKEN_LS), 'Content-Type':'application/json' }; };
+    btn.onclick = function(){
+      btn.disabled = true; btn.textContent = 'Dispatching…'; msg.textContent = '';
+      fetch('/admin/lich-check', { method:'POST', headers:auth() })
+        .then(function(r){ return r.json(); })
+        .then(function(d){ msg.textContent = d.ok ? 'dispatched' : (d.error || 'failed'); poll(); })
+        .catch(function(){ msg.textContent = 'failed'; })
+        .then(function(){ btn.disabled = false; btn.textContent = 'Check now'; });
+    };
+    hold.onclick = function(){
+      var on = hold.dataset.hold === '1';
+      hold.disabled = true; hold.textContent = on ? 'Holding…' : 'Resuming…'; msg.textContent = '';
+      fetch('/maintenance/hold', { method:'POST', headers:auth(), body: JSON.stringify({ hold: on }) })
+        .then(function(r){ return r.json(); })
+        .then(function(d){ msg.textContent = d.ok ? (on ? 'held' : 'rescheduled') : (d.error || 'failed'); })
+        .catch(function(){ msg.textContent = 'failed'; })
+        .then(function(){ hold.disabled = false; poll(); });
     };
   })();
 
